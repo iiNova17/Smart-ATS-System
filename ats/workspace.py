@@ -10,9 +10,11 @@ import sqlite3
 from pathlib import Path
 
 from ats.client import BackendError
-from ats.matching import coverage_score, normalize, skill_matches, split_skills
+from ats.matching import canonical_skill, normalize, skill_evidence, skill_matches, split_skills
 from ats.validation import (
     validate_analysis,
+    validate_assessment,
+    validate_criteria,
     validate_cv,
     validate_rank,
     validate_search,
@@ -40,6 +42,11 @@ def open_workspace(directory, client_provider=None):
         """CREATE TABLE IF NOT EXISTS cvs (
         id TEXT PRIMARY KEY, filename TEXT NOT NULL, text TEXT NOT NULL,
         analysis TEXT, embedding TEXT)""",
+    )
+    query(
+        workspace,
+        """CREATE TABLE IF NOT EXISTS model_cache (
+          cache_key TEXT PRIMARY KEY, value TEXT NOT NULL)""",
     )
     return workspace
 
@@ -93,10 +100,12 @@ def get_cv(workspace, cv_id):
 def remove_cv(workspace, cv_id):
     # Cached analysis and vectors live in the same row and are removed with it.
     query(workspace, "DELETE FROM cvs WHERE id = ?", (cv_id,))
+    query(workspace, "DELETE FROM model_cache WHERE cache_key LIKE ?", ("assess:" + cv_id + ":%",))
 
 
 def clear_cvs(workspace):
     query(workspace, "DELETE FROM cvs")
+    query(workspace, "DELETE FROM model_cache")
 
 
 def unit_vector(values):
@@ -199,7 +208,7 @@ def retrieve(workspace, text, cv_id=None):
     return sorted(hits, key=lambda hit: (-hit["score"], hit["filename"]))
 
 
-def search_cvs(workspace, payload):
+def search_cvs(workspace, payload, progress=None):
     request = validate_search(payload)
     if request["mode"] == "keyword":
         keywords = split_skills(request["query"])
@@ -221,60 +230,157 @@ def search_cvs(workspace, payload):
                 )
         results.sort(key=lambda row: (-row["score"], row["filename"]))
     else:
-        best = {}
-        for hit in retrieve(workspace, request["query"]):
-            if hit["id"] not in best:
-                best[hit["id"]] = {
-                    "id": hit["id"],
-                    "filename": hit["filename"],
-                    "score": round(hit["score"], 4),
-                    "matched": [],
-                    "missing": [],
-                    "evidence": [{"skill": "Relevant passage", "quote": hit["text"]}],
-                }
-        results = list(best.values())
+        criteria = prepare_criteria(workspace, request["query"], request["required"])
+        results = assess_candidates(workspace, criteria, progress)
     return results[: request["limit"]]
 
 
-def rank_cvs(workspace, payload):
-    request = validate_rank(payload)
-    similarities = {}
-    if request["job_description"]:
-        similarities = {
-            row["id"]: row["score"]
-            for row in search_cvs(
-                workspace, {"query": request["job_description"], "mode": "semantic"}
+def cached_model_output(workspace, key, compute):
+    rows = query(workspace, "SELECT value FROM model_cache WHERE cache_key = ?", (key,))
+    if rows:
+        return json.loads(rows[0]["value"])
+    result = compute()
+    query(
+        workspace,
+        "INSERT OR REPLACE INTO model_cache (cache_key, value) VALUES (?, ?)",
+        (key, json.dumps(result, ensure_ascii=False)),
+    )
+    return result
+
+
+def prepare_criteria(workspace, text, required=None, preferred=None):
+    client = model_client(workspace)
+    required, preferred = required or [], preferred or []
+    request = text or "Find candidates with the following skills."
+    if required:
+        request += "\nExplicit required skills: " + ", ".join(required)
+    if preferred:
+        request += "\nExplicit preferred skills (not mandatory): " + ", ".join(preferred)
+    digest = hashlib.sha256(("criteria-v2:" + request).encode()).hexdigest()
+    criteria = validate_criteria(
+        cached_model_output(
+            workspace, "intent:" + digest, lambda: validate_criteria(client.interpret(request))
+        )
+    )
+    # Explicit form constraints cannot be dropped or made optional by the model.
+    for labels, mandatory in [(preferred, False), (required, True)]:
+        for label in labels:
+            found = next(
+                (
+                    item
+                    for item in criteria["requirements"]
+                    if canonical_skill(item["label"]) == canonical_skill(label)
+                ),
+                None,
             )
-        }
+            if found:
+                found["required"] = mandatory
+            else:
+                criteria["requirements"].append(
+                    {"label": label, "kind": "skill", "required": mandatory}
+                )
+    return validate_criteria(criteria)
+
+
+def verified_assessment(value, criteria, text):
+    result = validate_assessment(value, criteria)
+    source = " ".join(normalize(text).split())
+    for field in ("name", "headline"):
+        if result[field] and " ".join(normalize(result[field]).split()) not in source:
+            result[field] = None
+    for item, requirement in zip(result["assessments"], criteria["requirements"]):
+        item["quotes"] = [
+            quote for quote in item["quotes"] if " ".join(normalize(quote).split()) in source
+        ]
+        if item["status"] != "not_found" and not item["quotes"]:
+            item.update(status="not_found", reason="The model's evidence could not be verified.")
+        # Prevent a model from treating ROS 1 or an unversioned ROS mention as ROS 2.
+        key = canonical_skill(requirement["label"])
+        if key in {"ros1", "ros2"} and not any(
+            skill_evidence(quote, requirement["label"]) for quote in item["quotes"]
+        ):
+            item.update(
+                status="not_found", reason="The requested ROS version is not stated.", quotes=[]
+            )
+    return result
+
+
+def assess_candidates(workspace, criteria, progress=None):
+    """Use model reasoning as evidence; filtering and ordering happen entirely locally."""
+    criteria = validate_criteria(criteria)
+    client = model_client(workspace)
+    digest = hashlib.sha256(
+        ("assessment-v3:" + json.dumps(criteria, sort_keys=True)).encode()
+    ).hexdigest()
+    records = query(workspace, "SELECT id, filename, text, analysis FROM cvs")
     rows = []
-    for cv in query(workspace, "SELECT id, filename, text FROM cvs"):
-        required, missing_required = skill_matches(cv["text"], request["required"])
-        preferred, missing_preferred = skill_matches(cv["text"], request["preferred"])
+    for position, cv in enumerate(records, 1):
+        if progress:
+            progress(position - 1, len(records))
+        assessment = verified_assessment(
+            cached_model_output(
+                workspace,
+                "assess:" + cv["id"] + ":" + digest,
+                lambda: verified_assessment(
+                    client.evaluate(cv["text"], criteria), criteria, cv["text"]
+                ),
+            ),
+            criteria,
+            cv["text"],
+        )
+        items = assessment["assessments"]
+        required = [item for item, req in zip(items, criteria["requirements"]) if req["required"]]
+        # No related-but-insufficient candidate is presented as a required match.
+        if not assessment["relevant"] or any(item["status"] != "met" for item in required):
+            continue
+        if not any(item["status"] == "met" for item in items):
+            continue
+        total_weight = sum(2 if req["required"] else 1 for req in criteria["requirements"])
+        earned = sum(
+            (2 if req["required"] else 1)
+            * {"met": 1, "partial": 0.5, "not_found": 0}[item["status"]]
+            for item, req in zip(items, criteria["requirements"])
+        )
+        profile = json.loads(cv["analysis"] or "null") or {}
+        depth = sum(
+            {"listed": 1, "applied": 2, "extensive": 3}[item["depth"]]
+            for item in items
+            if item["status"] == "met"
+        ) / len(items)
+        matched, gaps, evidence, reasons = [], [], [], []
+        for item, req in zip(items, criteria["requirements"]):
+            (matched if item["status"] == "met" else gaps).append(req["label"])
+            if item["status"] == "met":
+                reasons.append({"requirement": req["label"], "reason": item["reason"]})
+            for quote in item["quotes"]:
+                evidence.append({"skill": req["label"], "quote": quote})
         rows.append(
             {
                 "id": cv["id"],
                 "filename": cv["filename"],
-                "score": coverage_score(
-                    len(request["required"]),
-                    len(request["preferred"]),
-                    len(required),
-                    len(preferred),
-                ),
-                "matched_required": [item["skill"] for item in required],
-                "matched_preferred": [item["skill"] for item in preferred],
-                "missing_required": missing_required,
-                "missing_preferred": missing_preferred,
-                "evidence": required + preferred,
-                "semantic_similarity": similarities.get(cv["id"]),
+                "name": profile.get("name") or assessment["name"],
+                "headline": profile.get("headline") or assessment["headline"],
+                "score": round(100 * earned / total_weight, 1),
+                "matched": matched,
+                "missing": gaps,
+                "evidence": evidence,
+                "reasons": reasons,
+                "explanation": assessment["explanation"],
+                "criteria": criteria,
+                "evidence_depth": depth,
             }
         )
-    rows.sort(
-        key=lambda row: (
-            -row["score"],
-            -(row["semantic_similarity"] if row["semantic_similarity"] is not None else 0),
-            row["filename"],
-        )
+    if progress:
+        progress(len(records), len(records))
+    return sorted(rows, key=lambda row: (-row["score"], -row["evidence_depth"], row["filename"]))
+
+
+def rank_cvs(workspace, payload, progress=None):
+    request = validate_rank(payload)
+    criteria = prepare_criteria(
+        workspace, request["job_description"], request["required"], request["preferred"]
     )
+    rows = assess_candidates(workspace, criteria, progress)
     for position, row in enumerate(rows, 1):
         row["rank"] = position
     return rows

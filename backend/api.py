@@ -1,10 +1,12 @@
 """Stateless model API: no CV library, search, ranking, or vector store."""
 
+import logging
 import secrets
+import traceback
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException
 
-from ats.validation import validate_analysis, validate_text
+from ats.validation import validate_analysis, validate_assessment, validate_criteria, validate_text
 
 
 def create_app(api_key, runtime):
@@ -12,7 +14,7 @@ def create_app(api_key, runtime):
         raise ValueError("ATS_API_KEY must contain at least 24 characters.")
     app = FastAPI(
         title="Smart ATS · Model service",
-        version="3.0.0",
+        version="4.0.0",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -27,12 +29,52 @@ def create_app(api_key, runtime):
             return operation(*args)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
-        except Exception:
-            raise HTTPException(503, "AI is temporarily unavailable. Please try again.") from None
+        except Exception as exc:
+            reference = secrets.token_hex(4)
+            # Print stack frames and error class, never CV text, credentials or model output.
+            logging.getLogger("smart_ats").error(
+                "Model request %s failed in %s: %s",
+                reference,
+                operation.__name__,
+                type(exc).__name__,
+            )
+            traceback.print_tb(exc.__traceback__)
+            memory_error = "outofmemory" in type(exc).__name__.lower()
+            message = (
+                "The model ran out of GPU memory. Restart the Kaggle session and load the "
+                "model once."
+                if memory_error
+                else "The model could not finish this request. Check the Kaggle error reference."
+            )
+            raise HTTPException(
+                503,
+                {
+                    "message": message,
+                    "reference": reference,
+                    "code": "gpu_memory" if memory_error else "model_error",
+                },
+            ) from None
 
     @app.get("/health", dependencies=[Depends(authenticate)])
     def health():
-        return {"status": "ok", "version": "3.0.0"}
+        return {"status": "ok", "version": "4.0.0"}
+
+    def interpretation_request(payload):
+        text = validate_text(payload.get("query"), "Search request", 1, 6000)
+        return validate_criteria(runtime["interpret_query"](text))
+
+    @app.post("/interpret", dependencies=[Depends(authenticate)])
+    def interpret(payload: dict = Body()):
+        return {"criteria": run(interpretation_request, payload)}
+
+    def evaluation_request(payload):
+        text = validate_text(payload.get("text"), "CV text", 40, 30000)
+        criteria = validate_criteria(payload.get("criteria"))
+        return validate_assessment(runtime["evaluate_text"](text, criteria), criteria)
+
+    @app.post("/evaluate", dependencies=[Depends(authenticate)])
+    def evaluate(payload: dict = Body()):
+        return {"assessment": run(evaluation_request, payload)}
 
     def embedding_request(payload):
         texts = payload.get("texts")

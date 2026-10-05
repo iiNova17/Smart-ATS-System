@@ -1,4 +1,4 @@
-"""Smart ATS: local candidate workflows with privately configured model inference."""
+"""Smart ATS: a local candidate workspace powered by private model inference."""
 
 import html
 import json
@@ -6,7 +6,6 @@ import logging
 import os
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -18,18 +17,19 @@ from ats.workspace import (
     add_cv,
     analyze_cv,
     ask_cv,
+    assess_candidates,
     clear_cvs,
     get_cv,
     list_cvs,
     open_workspace,
-    rank_cvs,
+    prepare_criteria,
     remove_cv,
-    search_cvs,
 )
 
 ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env", override=True)
-st.set_page_config(page_title="Smart ATS · Talent workspace", page_icon="◈", layout="wide")
+# Environment variables take precedence, so deployments and isolated checks can override .env.
+load_dotenv(ROOT / ".env", override=False)
+st.set_page_config(page_title="Smart ATS", page_icon="◈", layout="wide")
 st.markdown(
     "<style>" + (ROOT / "assets/style.css").read_text(encoding="utf-8") + "</style>",
     unsafe_allow_html=True,
@@ -71,7 +71,7 @@ def show_error(exc):
         st.error(str(exc))
     else:
         logging.getLogger(__name__).error("Candidate operation failed: %s", type(exc).__name__)
-        st.error("We couldn’t complete this request. Please try again.")
+        st.error("This operation could not finish. Please retry.")
 
 
 def chips(values, missing=False):
@@ -85,10 +85,10 @@ def chips(values, missing=False):
     )
 
 
-def empty(title, description, symbol="◈"):
+def empty(title, description, symbol=""):
     st.markdown(
-        f'<div class="empty"><div class="empty-symbol">{html.escape(symbol)}</div>'
-        f"<strong>{html.escape(title)}</strong><p>{html.escape(description)}</p></div>",
+        f'<div class="empty"><strong>{html.escape(title)}</strong>'
+        f"<p>{html.escape(description)}</p></div>",
         unsafe_allow_html=True,
     )
 
@@ -101,63 +101,41 @@ def bullet_details(values):
 
 
 def page_header(title, description):
-    st.title(title)
-    st.caption(description)
+    st.markdown(
+        f'<div class="page-heading"><h1>{html.escape(title)}</h1>'
+        f"<p>{html.escape(description)}</p></div>",
+        unsafe_allow_html=True,
+    )
 
 
 def configured_client():
-    url = api_url_from_env()
-    key = os.getenv("ATS_API_KEY", "").strip()
+    url, key = api_url_from_env(), os.getenv("ATS_API_KEY", "").strip()
     signature = (url, key)
     if st.session_state.get("endpoint_signature") != signature:
         st.session_state.client = None
         st.session_state.endpoint_signature = signature
+        invalidate()
     if not url or not key:
         return None
     if st.session_state.client is None:
         client = APIClient(url, key)
         health = client.health()
-        if health.get("status") != "ok" or health.get("version") != "3.0.0":
-            raise BackendError("AI needs an update. Please contact your administrator.")
+        if health.get("status") != "ok" or health.get("version") != "4.0.0":
+            raise BackendError(
+                "The AI service needs the updated Kaggle notebook (API 4.0). "
+                "Restart its server with the new notebook, then retry."
+            )
         st.session_state.client = client
     return st.session_state.client
 
 
 init_state()
-with st.sidebar:
-    st.markdown(
-        '<div class="brand"><div class="brand-mark">◈</div><div><div class="brand-name">Smart ATS</div>'
-        '<div class="brand-sub">Talent workspace</div></div></div>'
-        '<div class="sidebar-section">WORKSPACE</div>',
-        unsafe_allow_html=True,
-    )
-    for route, label, icon in [
-        ("CV library", "Candidates", ":material/folder_open:"),
-        ("Search candidates", "Search", ":material/manage_search:"),
-        ("Rank candidates", "Shortlist", ":material/format_list_numbered:"),
-        ("CV analysis", "Candidate profile", ":material/badge:"),
-    ]:
-        st.button(
-            label,
-            icon=icon,
-            key="nav_" + route.replace(" ", "_").lower(),
-            use_container_width=True,
-            type="primary" if st.session_state.page == route else "secondary",
-            on_click=navigate,
-            args=(route,),
-        )
-    st.markdown(
-        '<div class="sidebar-note"><div class="sidebar-section">THOUGHTFUL HIRING</div>'
-        "<p>A clear view of every candidate.<br>Evidence behind every match.</p></div>",
-        unsafe_allow_html=True,
-    )
-
 try:
     workspace = open_workspace(os.getenv("ATS_DATA_DIR") or ROOT / ".data", configured_client)
     cvs = list_cvs(workspace)
 except Exception as exc:
     logging.getLogger(__name__).error("Local storage unavailable: %s", type(exc).__name__)
-    st.error("Your local library could not be opened. Check that its folder is writable.")
+    st.error("Your library could not be opened. Check that its folder is writable.")
     st.stop()
 
 library_ids = tuple(sorted(cv["id"] for cv in cvs))
@@ -165,281 +143,259 @@ if st.session_state.get("library_ids") != library_ids:
     invalidate()
     st.session_state.library_ids = library_ids
 
+st.markdown('<div class="brand">Smart <span>ATS</span></div>', unsafe_allow_html=True)
+with st.container(key="navigation"):
+    columns = st.columns(4, gap="small")
+    for column, route, label in zip(
+        columns,
+        ["CV library", "Search candidates", "Rank candidates", "CV analysis"],
+        ["Candidates", "Search", "Shortlist", "Profile"],
+    ):
+        column.button(
+            label,
+            key="nav_" + route.replace(" ", "_").lower(),
+            type="primary" if st.session_state.page == route else "secondary",
+            use_container_width=True,
+            on_click=navigate,
+            args=(route,),
+        )
 page = st.session_state.page
-breadcrumbs = {
-    "CV library": "CANDIDATES",
-    "Search candidates": "SEARCH",
-    "Rank candidates": "SHORTLIST",
-    "CV analysis": "CANDIDATE PROFILE",
-}
-st.markdown(
-    '<div class="workspace-top"><span class="eyebrow">WORKSPACE / '
-    + breadcrumbs[page]
-    + '</span><span class="workspace-tag">CV intelligence</span></div>',
-    unsafe_allow_html=True,
-)
 
 
 def library_page():
-    page_header("Candidate library", "Bring your candidates together. Find the skills that matter.")
-    metrics = st.columns(3)
-    metrics[0].metric("Candidates", len(cvs))
-    analyzed = sum(cv["analyzed"] for cv in cvs)
-    metrics[1].metric("Profiles ready", analyzed)
-    metrics[2].metric("Awaiting analysis", len(cvs) - analyzed)
-
-    import_column, library_column = st.columns([1, 1.75], gap="large")
-    with import_column:
+    page_header(
+        "Your candidate library", "Add CVs, find the right experience, and explore each profile."
+    )
+    files = st.file_uploader(
+        "Upload CVs",
+        type=["pdf", "docx", "txt"],
+        accept_multiple_files=True,
+        key=f"uploader_{st.session_state.upload_version}",
+        help="Upload one CV or a batch. Scanned PDFs need readable text.",
+    )
+    st.caption("PDF, DOCX or TXT · Documents are stored in your local workspace.")
+    if st.button("Add to library", type="primary", disabled=not files, key="import_cvs"):
+        outcomes = []
+        progress = st.progress(0, text="Reading documents…")
+        for index, file in enumerate(files, 1):
+            try:
+                result = add_cv(workspace, extract_cv(file.name, file.getvalue()).model_dump())
+                outcomes.append(
+                    {
+                        "Document": file.name,
+                        "Status": "Already added" if result["duplicate"] else "Added",
+                        "Details": "Ready to search",
+                    }
+                )
+            except Exception as exc:
+                outcomes.append(
+                    {
+                        "Document": file.name,
+                        "Status": "Needs attention",
+                        "Details": str(exc)
+                        if isinstance(exc, ValueError)
+                        else "Could not read this document.",
+                    }
+                )
+            progress.progress(index / len(files), text=f"Read {index} of {len(files)} documents")
+        st.session_state.upload_results = outcomes
+        st.session_state.upload_version += 1
+        invalidate()
+        st.rerun()
+    if st.session_state.upload_results:
+        outcomes = st.session_state.upload_results
+        st.caption(f"Last import · {sum(row['Status'] == 'Added' for row in outcomes)} added")
+        with st.expander(
+            "Import details", expanded=any(row["Status"] == "Needs attention" for row in outcomes)
+        ):
+            st.dataframe(outcomes, hide_index=True, use_container_width=True)
+    st.divider()
+    heading, action = st.columns([4, 1.5])
+    heading.subheader(f"Candidates · {len(cvs)}")
+    action.button(
+        "Search library",
+        on_click=navigate,
+        args=("Search candidates",),
+        use_container_width=True,
+        disabled=not cvs,
+    )
+    if not cvs:
+        empty(
+            "Start with a CV",
+            "Upload one or more documents above. Your library stays here between sessions.",
+        )
+        return
+    filter_text = st.text_input("Find a candidate", placeholder="Search name or document…")
+    visible = [
+        cv
+        for cv in cvs
+        if filter_text.casefold() in ((cv.get("name") or "") + " " + cv["filename"]).casefold()
+    ]
+    for cv in visible:
         with st.container(border=True):
-            st.markdown(
-                '<div class="card-eyebrow">GROW YOUR TALENT POOL</div>', unsafe_allow_html=True
-            )
-            st.subheader("Add candidates")
-            st.caption("Upload one CV or add a batch in a single step.")
-            files = st.file_uploader(
-                "Upload CVs",
-                type=["pdf", "docx", "txt"],
-                accept_multiple_files=True,
-                key=f"uploader_{st.session_state.upload_version}",
-                help="PDF, Word, or text documents. Scanned documents need readable text first.",
-            )
-            st.caption("PDF, DOCX, TXT · Original documents stay on your device.")
-            if st.button(
-                "Add to library",
-                icon=":material/add:",
-                type="primary",
+            info, action = st.columns([4, 1.5])
+            info.markdown(f"**{html.escape(cv.get('name') or Path(cv['filename']).stem)}**")
+            info.caption(cv.get("headline") or cv["filename"])
+            info.caption("Profile ready" if cv["analyzed"] else "Ready to prepare profile")
+            action.button(
+                "Open profile",
+                key="view_" + cv["id"],
                 use_container_width=True,
-                disabled=not files,
-            ):
-                outcomes = []
-                progress = st.progress(0, text="Preparing documents…")
-                for i, file in enumerate(files):
-                    try:
-                        cv = extract_cv(file.name, file.getvalue())
-                        result = add_cv(workspace, cv.model_dump())
-                        status = "Already added" if result["duplicate"] else "Added"
-                        outcomes.append(
-                            {"Document": file.name, "Status": status, "Details": "Ready to review"}
-                        )
-                    except Exception as exc:
-                        detail = (
-                            str(exc)
-                            if isinstance(exc, (ValueError, BackendError))
-                            else "Could not read this document."
-                        )
-                        outcomes.append(
-                            {"Document": file.name, "Status": "Needs attention", "Details": detail}
-                        )
-                    progress.progress(
-                        (i + 1) / len(files), text=f"Processed {i + 1} of {len(files)} documents"
-                    )
-                st.session_state.upload_results = outcomes
-                invalidate()
-                st.rerun()
-            st.markdown(
-                '<div class="import-note"><strong>From upload to understanding</strong>'
-                "<p>Search skills across your library, build a shortlist, then open a profile to explore the details.</p></div>",
-                unsafe_allow_html=True,
+                on_click=navigate,
+                args=("CV analysis", cv["id"]),
             )
-        if st.session_state.upload_results:
-            outcomes = st.session_state.upload_results
-            added = sum(row["Status"] == "Added" for row in outcomes)
-            errors = sum(row["Status"] == "Needs attention" for row in outcomes)
-            st.caption(f"Last import · {added} added · {errors} need attention")
-            with st.expander("Import details", expanded=bool(errors)):
-                st.dataframe(outcomes, hide_index=True, use_container_width=True)
-
-    with library_column:
-        title, refresh = st.columns([4, 1])
-        title.subheader("Your candidates")
-        if refresh.button("Refresh", icon=":material/refresh:"):
+    if not visible:
+        empty("No candidate found", "Try another name or filename.")
+    with st.expander("Manage documents"):
+        labels = {cv["id"]: cv["filename"] for cv in cvs}
+        delete_id = st.selectbox("Document to remove", list(labels), format_func=labels.get)
+        if st.button("Remove document"):
+            remove_cv(workspace, delete_id)
             invalidate()
             st.rerun()
-        if not cvs:
-            empty(
-                "Your talent pool starts here",
-                "Add CVs to search, compare, and understand your candidates.",
+        clear_check = st.checkbox("Remove every document from this workspace")
+        if st.button("Clear library", disabled=not clear_check):
+            clear_cvs(workspace)
+            invalidate()
+            st.rerun()
+
+
+def run_matching(query, required, preferred=None):
+    progress = st.progress(0, text="Understanding your request…")
+    try:
+        criteria = prepare_criteria(workspace, query, required, preferred)
+
+        def update(done, total):
+            progress.progress(
+                done / max(total, 1), text=f"Reviewing candidate {min(done + 1, total)} of {total}…"
             )
-            return
-        filter_text = st.text_input(
-            "Find a candidate", placeholder="Search name or document…", label_visibility="collapsed"
-        )
-        visible = [
-            cv
-            for cv in cvs
-            if filter_text.casefold() in ((cv.get("name") or "") + " " + cv["filename"]).casefold()
+
+        rows = assess_candidates(workspace, criteria, update)
+        return {"rows": rows, "criteria": criteria, "query": query, "reviewed": len(cvs)}
+    finally:
+        progress.empty()
+
+
+def render_results(result, shortlist=False):
+    if result is None:
+        empty("Describe what matters", "Combine skills and practical experience in one request.")
+        return
+    rows, criteria = result["rows"], result["criteria"]
+    st.divider()
+    heading, download = st.columns([4, 1.5])
+    heading.subheader(("Your shortlist" if shortlist else "Results") + f" · {len(rows)}")
+    st.caption(f"Reviewed {result['reviewed']} candidates · Showing supported matches only")
+    with st.expander("What the AI looked for"):
+        st.text(criteria["intent"])
+        for item in criteria["requirements"]:
+            st.text(("Required: " if item["required"] else "Preferred: ") + item["label"])
+    if rows:
+        export = [
+            {
+                "Rank": index,
+                "Candidate": row["name"] or row["filename"],
+                "Criteria coverage": row["score"],
+                "Matches": ", ".join(row["matched"]),
+                "Preferred gaps": ", ".join(row["missing"]),
+                "Why it fits": row["explanation"],
+            }
+            for index, row in enumerate(rows, 1)
         ]
-        st.caption(f"{len(visible)} " + ("candidate" if len(visible) == 1 else "candidates"))
-        for cv in visible:
-            with st.container(border=True):
-                info, action = st.columns([4, 1.3])
-                name = (
-                    cv.get("name")
-                    or Path(cv["filename"]).stem.replace("_", " ").replace("-", " ").title()
-                )
-                label = "Profile ready" if cv["analyzed"] else "Ready to analyze"
-                info.markdown(
-                    '<div class="candidate-row"><div class="candidate-avatar">'
-                    + html.escape("".join(word[0] for word in name.split()[:2]))
-                    + '</div><div><div class="candidate-name">'
-                    + html.escape(name)
-                    + '</div><div class="candidate-meta">'
-                    + html.escape(cv.get("headline") or cv["filename"])
-                    + "</div></div></div>",
-                    unsafe_allow_html=True,
-                )
-                info.caption(label)
-                action.button(
-                    "View profile",
-                    key="view_" + cv["id"],
-                    use_container_width=True,
-                    on_click=navigate,
-                    args=("CV analysis", cv["id"]),
-                )
-        if not visible:
-            empty("No candidates found", "Try another name or document.")
-        with st.expander("Manage documents"):
-            labels = {cv["id"]: cv["filename"] for cv in cvs}
-            delete_id = st.selectbox("Document to remove", list(labels), format_func=labels.get)
-            if st.button("Remove document"):
-                try:
-                    remove_cv(workspace, delete_id)
-                    invalidate()
-                    st.rerun()
-                except Exception as exc:
-                    show_error(exc)
-            clear_check = st.checkbox("Remove every document from this workspace")
-            if st.button("Clear library", disabled=not clear_check):
-                try:
-                    clear_cvs(workspace)
-                    invalidate()
-                    st.session_state.upload_results = []
-                    st.session_state.upload_version += 1
-                    st.rerun()
-                except Exception as exc:
-                    show_error(exc)
+        download.download_button(
+            "Export results",
+            csv_export(export),
+            "candidate_shortlist.csv" if shortlist else "candidate_search.csv",
+            "text/csv",
+            use_container_width=True,
+        )
+    else:
+        empty(
+            "No supported matches",
+            "No CV met all required criteria. Review the interpreted "
+            "requirements, adjust your request, or add more candidates.",
+        )
+    if shortlist:
+        st.caption(
+            "Ordered by evidence-backed criteria coverage. Required criteria carry twice "
+            "the weight of preferred criteria; concrete experience breaks ties. "
+            "This score measures coverage, not ability."
+        )
+    for index, row in enumerate(rows, 1):
+        with st.container(border=True):
+            info, action = st.columns([4, 1.5])
+            name = row["name"] or Path(row["filename"]).stem
+            info.markdown(f"**{str(index) + '. ' if shortlist else ''}{html.escape(name)}**")
+            info.caption(row["headline"] or row["filename"])
+            if shortlist:
+                info.caption(f"{row['score']:.0f}% criteria coverage")
+            action.button(
+                "Open profile",
+                key=("rank_" if shortlist else "search_") + row["id"],
+                on_click=navigate,
+                args=("CV analysis", row["id"]),
+                use_container_width=True,
+            )
+            st.text(row["explanation"])
+            with st.expander("Why this candidate matters"):
+                for reason in row["reasons"]:
+                    st.markdown("**" + html.escape(reason["requirement"]) + "**")
+                    st.text(reason["reason"])
+                if row["missing"]:
+                    st.caption(
+                        "Preferred criteria not fully supported: " + ", ".join(row["missing"])
+                    )
+            with st.expander("CV evidence"):
+                for item in row["evidence"]:
+                    st.caption(item["skill"])
+                    st.text(item["quote"])
 
 
 def search_page():
-    page_header(
-        "Find your next match", "Search across your candidates by skills, keywords, or experience."
-    )
-    with st.form("search_form", border=True):
-        query = st.text_input(
-            "What are you looking for?", placeholder="Python, SQL, LangChain", max_chars=1000
+    page_header("Find the right experience", "Search skills, keywords and experience together.")
+    with st.form("search_form", border=False):
+        query = st.text_area(
+            "What are you looking for?",
+            placeholder="Python and ROS 2 with hands-on autonomous robot navigation experience",
+            height=110,
+            max_chars=5000,
         )
-        left, right = st.columns(2)
-        method = left.selectbox("Search by", ["Skills & keywords", "Experience & meaning"])
-        rule = right.selectbox("Match", ["All keywords", "Any keyword"])
-        st.caption("Separate skills with commas, or describe the experience you need.")
+        required = st.text_input(
+            "Required skills (optional)",
+            placeholder="Python, ROS 2",
+            help="Separate skills with commas. These must be supported in the CV.",
+        )
         submitted = st.form_submit_button(
-            "Find candidates",
-            icon=":material/search:",
-            type="primary",
-            disabled=not cvs,
+            "Find candidates", type="primary", use_container_width=True, disabled=not cvs
         )
     if submitted:
         st.session_state.search_results = None
         try:
-            request = validate_search(
-                {
-                    "query": query,
-                    "mode": "keyword" if method == "Skills & keywords" else "semantic",
-                    "match": "all" if rule == "All keywords" else "any",
-                }
-            )
-            with st.spinner("Finding relevant candidates…"):
-                rows = search_cvs(workspace, request)
-            st.session_state.search_results = {
-                "rows": rows,
-                "query": query,
-                "mode": request["mode"],
-            }
+            request = validate_search({"query": query, "required": split_skills(required)})
+            st.session_state.search_results = run_matching(request["query"], request["required"])
         except Exception as exc:
             show_error(exc)
-    result = st.session_state.search_results
     if not cvs:
         empty("Add your first candidates", "Upload CVs in Candidates to start searching.")
-    elif result is None:
-        empty(
-            "The right experience, within reach",
-            "Search your library to see relevant candidates and the passages behind each match.",
-        )
     else:
-        rows = result["rows"]
-        heading, download = st.columns([4, 1.6])
-        heading.subheader(f"{len(rows)} " + ("match" if len(rows) == 1 else "matches"))
-        st.caption("Results for: " + result["query"])
-        if rows:
-            export = [
-                {
-                    "Candidate": row["filename"],
-                    "Matches": ", ".join(row["matched"]),
-                    "Score": row["score"],
-                }
-                for row in rows
-            ]
-            download.download_button(
-                "Export results",
-                csv_export(export),
-                "candidate_search.csv",
-                "text/csv",
-                icon=":material/download:",
-            )
-        if not rows:
-            empty("No matches yet", "Try fewer keywords, another phrase, or matching any keyword.")
-        for row in rows:
-            with st.container(border=True):
-                info, action = st.columns([4, 1.3])
-                info.text(row["filename"])
-                if result["mode"] == "keyword":
-                    with info:
-                        chips(row["matched"])
-                else:
-                    info.caption("Matched by relevant experience")
-                action.button(
-                    "View profile",
-                    key="search_" + row["id"],
-                    on_click=navigate,
-                    args=("CV analysis", row["id"]),
-                    use_container_width=True,
-                )
-                with st.expander("Why this candidate matches"):
-                    for item in row["evidence"]:
-                        st.text(item["skill"])
-                        st.text(item["quote"])
+        render_results(st.session_state.search_results)
 
 
 def rank_page():
     page_header(
-        "Build a stronger shortlist", "Compare candidates against the skills your role needs."
+        "Build your shortlist", "Compare practical experience against the work your role needs."
     )
-    with st.form("rank_form", border=True):
+    with st.form("rank_form", border=False):
         left, right = st.columns(2)
-        required = left.text_area(
-            "Required skills",
-            placeholder="Python, SQL",
-            height=105,
-            help="Separate skills with commas.",
-        )
-        preferred = right.text_area(
-            "Nice-to-have skills",
-            placeholder="LangChain, RAG",
-            height=105,
-            help="Separate skills with commas.",
-        )
-        job_description = st.text_area(
-            "Role description",
-            placeholder="Add context about the role (optional).",
-            help="Uses AI to order candidates with equal skill coverage. Leave empty for skill-only ranking.",
-            height=115,
-            max_chars=6000,
+        required = left.text_input("Required skills", placeholder="Python, ROS 2")
+        preferred = right.text_input("Preferred skills", placeholder="C++, SLAM, Linux")
+        description = st.text_area(
+            "Role and experience",
+            height=140,
+            max_chars=5000,
+            placeholder="Describe the work, relevant projects and experience you need.",
         )
         submitted = st.form_submit_button(
-            "Create shortlist",
-            icon=":material/format_list_numbered:",
-            type="primary",
-            disabled=not cvs,
+            "Create shortlist", type="primary", use_container_width=True, disabled=not cvs
         )
     if submitted:
         st.session_state.rank_results = None
@@ -448,84 +404,18 @@ def rank_page():
                 {
                     "required": split_skills(required),
                     "preferred": split_skills(preferred),
-                    "job_description": job_description,
+                    "job_description": description,
                 }
             )
-            with st.spinner("Comparing your candidates…"):
-                rows = rank_cvs(workspace, criteria)
-            st.session_state.rank_results = {"rows": rows, "criteria": criteria}
+            st.session_state.rank_results = run_matching(
+                criteria["job_description"], criteria["required"], criteria["preferred"]
+            )
         except Exception as exc:
             show_error(exc)
-    result = st.session_state.rank_results
     if not cvs:
-        empty(
-            "Your shortlist starts with candidates",
-            "Upload CVs in Candidates, then define the skills for your role.",
-        )
-    elif result is None:
-        empty(
-            "A clear comparison, backed by evidence",
-            "Add the skills you need to see who matches and where information is missing.",
-        )
+        empty("Start with your candidates", "Upload CVs in Candidates, then define your role.")
     else:
-        rows, criteria = result["rows"], result["criteria"]
-        heading, download = st.columns([4, 1.6])
-        heading.subheader("Your shortlist")
-        table = [
-            {
-                "Rank": row["rank"],
-                "Candidate": row["filename"],
-                "Skill coverage": row["score"],
-                "Required matches": ", ".join(row["matched_required"]),
-                "Not found": ", ".join(row["missing_required"]),
-                "Nice-to-have matches": ", ".join(row["matched_preferred"]),
-            }
-            for row in rows
-        ]
-        download.download_button(
-            "Export shortlist",
-            csv_export(table),
-            "candidate_shortlist.csv",
-            "text/csv",
-            icon=":material/download:",
-        )
-        st.caption("Based on: " + ", ".join(criteria["required"] + criteria["preferred"]))
-        st.dataframe(
-            pd.DataFrame(table),
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "Skill coverage": st.column_config.ProgressColumn(
-                    min_value=0, max_value=100, format="%.0f%%"
-                )
-            },
-        )
-        with st.expander("How the comparison works"):
-            st.write(
-                "Required skills contribute 80% and nice-to-have skills 20%. If you use only one group, it contributes the full score."
-            )
-            st.write(
-                "Coverage reflects terms found in a CV, not proficiency. Check the evidence and context. A role description breaks ties by relevant experience."
-            )
-        for row in rows:
-            with st.expander(
-                f"{row['rank']:02d} · {row['filename']} · {row['score']:.0f}% coverage"
-            ):
-                match, missing = st.columns(2)
-                with match:
-                    st.caption("MATCHED SKILLS")
-                    chips(row["matched_required"] + row["matched_preferred"])
-                with missing:
-                    st.caption("NOT FOUND IN THE CV")
-                    chips(row["missing_required"] + row["missing_preferred"], missing=True)
-                for item in row["evidence"]:
-                    st.text(item["skill"] + ": " + item["quote"])
-                st.button(
-                    "View candidate",
-                    key="rank_" + row["id"],
-                    on_click=navigate,
-                    args=("CV analysis", row["id"]),
-                )
+        render_results(st.session_state.rank_results, shortlist=True)
 
 
 def analysis_page():

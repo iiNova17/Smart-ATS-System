@@ -14,8 +14,27 @@ def split_skills(text):
     return list(dict.fromkeys(x.strip() for x in text.split(",") if x.strip()))
 
 
+def canonical_skill(skill):
+    normalized = normalize(skill.strip())
+    compact = re.sub(r"[\s_-]+", "", normalized)
+    aliases = {
+        "robotoperatingsystem": "ros",
+        "robotoperatingsystem1": "ros1",
+        "robotoperatingsystem2": "ros2",
+    }
+    return aliases.get(compact, compact if compact in {"ros", "ros1", "ros2"} else normalized)
+
+
 def skill_pattern(skill):
     # Lookarounds preserve punctuation-heavy skills such as C++, C#, and .NET.
+    canonical = canonical_skill(skill)
+    aliases = {
+        "ros2": r"(?:ros[\s_-]*2|robot\s+operating\s+system[\s_-]*2)",
+        "ros1": r"(?:ros[\s_-]*1|robot\s+operating\s+system[\s_-]*1)",
+        "ros": r"(?:ros(?:[\s_-]*[12])?|robot\s+operating\s+system(?:[\s_-]*[12])?)",
+    }
+    if canonical in aliases:
+        return re.compile(r"(?<!\w)" + aliases[canonical] + r"(?!\w)")
     parts = re.split(r"\s+", normalize(skill.strip()))
     return re.compile(r"(?<!\w)" + r"\s+".join(re.escape(x) for x in parts) + r"(?!\w)")
 

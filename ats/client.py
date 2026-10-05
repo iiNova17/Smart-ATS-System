@@ -90,6 +90,10 @@ class APIClient:
             )
         if not response.ok:
             detail = data.get("detail", "Request failed.")
+            if response.status_code == 503 and isinstance(detail, dict):
+                message = detail.get("message", "The model could not finish this request.")
+                reference = detail.get("reference", "unknown")
+                raise BackendError(f"{message} Reference: {reference}.")
             if isinstance(detail, list):
                 detail = "; ".join(item.get("msg", "Invalid request") for item in detail)
             if response.status_code in {400, 404, 422}:
@@ -108,7 +112,15 @@ class APIClient:
         return self.request("POST", "/embed", {"texts": texts}, timeout=300)
 
     def analyze(self, text):
-        return self.request("POST", "/analyze", {"text": text}, timeout=300)["analysis"]
+        return self.request("POST", "/analyze", {"text": text}, timeout=900)["analysis"]
+
+    def interpret(self, query):
+        return self.request("POST", "/interpret", {"query": query}, timeout=300)["criteria"]
+
+    def evaluate(self, text, criteria):
+        return self.request("POST", "/evaluate", {"text": text, "criteria": criteria}, timeout=900)[
+            "assessment"
+        ]
 
     def answer(self, question, passages):
         return self.request(

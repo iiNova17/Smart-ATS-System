@@ -50,7 +50,11 @@ def install_command():
         for line in (ROOT / "requirements-kaggle.txt").read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.startswith("#")
     ]
-    return "%pip install -q " + " ".join('"' + package + '"' for package in packages) + "\n"
+    return (
+        "import sys\n!{sys.executable} -m pip install -q "
+        + " ".join('"' + package + '"' for package in packages)
+        + "\n"
+    )
 
 
 markdown("""# Smart ATS · Kaggle model service
@@ -59,7 +63,7 @@ file uploads, search, ranking, database, or retrieval runs in this notebook.**
 All code uses functions and dictionaries, with zero custom classes.
 
 Your local Streamlit app stores CV text, profiles, and vectors in SQLite; it performs
-keyword matching, scoring, similarity search, passage retrieval, and exports locally.
+evidence verification, relevance filtering, scoring, passage retrieval, and exports locally.
 Both the language model and embedding model run on Kaggle.
 
 Enable GPU and Internet in a private notebook. Add `NGROK_AUTHTOKEN`, `NGROK_DOMAIN`, and `ATS_API_KEY`
@@ -106,6 +110,8 @@ code(
             "validate_text",
             "fill_fields",
             "validate_analysis",
+            "validate_criteria",
+            "validate_assessment",
         },
     )
 )
@@ -120,6 +126,8 @@ code(
 )
 markdown("""## Block 5 — Build inference functions and chains
 Profile: `prompt | model | complete JSON check | JsonOutputParser | validation`.
+Search interpretation and candidate assessment use the same JSON chain pattern.
+Long CVs are processed in 2,200-token sections; no CV section is silently discarded.
 Question: `prompt | model | StrOutputParser`.
 
 `embed_texts` returns vectors and passage text; it keeps no index. The local app caches
@@ -133,6 +141,9 @@ code(
         {
             "EMBEDDING_VERSION",
             "build_analysis_parser",
+            "build_json_parser",
+            "merge_profiles",
+            "merge_assessments",
             "make_runtime",
         },
     )
@@ -144,6 +155,8 @@ FastAPI is a small HTTP wrapper around the functions:
 - `POST /embed`: text → passages and vectors.
 - `POST /analyze`: CV text → parsed profile.
 - `POST /answer`: question + locally retrieved passages → answer.
+- `POST /interpret`: search request → normalized requirements and experience criteria.
+- `POST /evaluate`: CV text + criteria → evidence-backed assessment and explanation.
 
 There are no `/cvs`, `/search`, or `/rank` endpoints and no collection/session state.
 Text exists transiently during inference; no application code saves CVs here.
@@ -176,7 +189,7 @@ for attempt in range(40):
         response = requests.get("http://127.0.0.1:8000/health",
                                 headers={"Authorization": "Bearer " + ATS_API_KEY}, timeout=2)
         response.raise_for_status()
-        assert response.json()["version"] == "3.0.0"
+        assert response.json()["version"] == "4.0.0"
         print("Model API ready on port 8000.")
         break
     time.sleep(0.5)
@@ -220,7 +233,7 @@ assert url.rstrip("/") == "https://" + NGROK_DOMAIN, "Unexpected endpoint URL."
 
 response = requests.get(url + "/health", headers=headers, timeout=30)
 response.raise_for_status()
-assert response.json()["version"] == "3.0.0"
+assert response.json()["version"] == "4.0.0"
 print("Fixed endpoint is ready. Start the local app and upload your PDFs.")
 """)
 markdown("""## Block 10 — Stop when finished
@@ -238,14 +251,17 @@ print("Shutdown requested. Your local candidate library is unaffected.")
 markdown("""## Troubleshooting
 - Download/GPU: enable Internet and GPU; check your Kaggle quota.
 - Memory: restart to unload old models; begin with a shorter CV.
-- Invalid JSON: one retry is included; inspect the CV text and try a shorter document.
+- Invalid JSON: one retry is included; fenced JSON is accepted, incomplete JSON is rejected.
+- Profile/server failure: match the app's error reference to the Kaggle cell output. The error
+  class and stack frames are logged without credentials or CV text. Restart the kernel if the
+  error is GPU memory related; run the model-loading block once, then rebuild chains/server.
 - Connection: check Block 7, Block 8, `.env` URL, and matching API key.
 - Endpoint offline: keep Kaggle alive; rerun server/endpoint cells using the same domain.
 - Domain rejected: verify ownership and the authtoken's account in the ngrok dashboard.
 - Endpoint already online: stop another agent/session using this domain, then rerun Block 8.
 - A Future has no `.url()`: use Block 8 unchanged with its `await` calls.
-- Offline: imports, library browsing, keyword search, skill ranking, and cached profiles
-  still work locally. New AI outputs require this service.
+- Offline: imports, library browsing, cached profiles and exports still work locally.
+  AI search, shortlisting and new profiles/answers require this service.
 
 References: [Qwen](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507),
 [MiniLM](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2),

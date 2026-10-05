@@ -12,10 +12,11 @@ The official `ngrok` Python SDK connects them through **your account's fixed dom
 
 - **Candidates:** import one CV or a batch of PDF, DOCX, or TXT files, inspect per-file results,
   filter the library, preview extracted text, and remove documents.
-- **Search:** find literal skills/keywords or search by relevant experience. Review the
-  source passage behind each match and export results to CSV.
-- **Shortlist:** compare required and preferred skills with coverage scores, supporting
-  evidence, missing terms, and CSV export.
+- **Search:** combine skills, keywords and experience in one natural-language request.
+  The AI understands equivalent wording, assesses practical relevance, and explains why
+  each candidate matters. Only candidates with supported required criteria appear.
+- **Shortlist:** compare required skills, preferred skills and role experience together.
+  Order matches by verified criteria coverage, then depth of relevant experience; export CSV.
 - **Candidate profile:** prepare structured contact, skills, experience, education, projects,
   and other professional details. Ask questions grounded in that candidate's CV and export JSON.
 
@@ -27,7 +28,7 @@ selector, API-key form, or capacity controls. No example CVs are bundled; use yo
 ```text
 Browser → Streamlit on your computer
              ├─ CV extraction, SQLite library, caches, and exports
-             ├─ Keyword search, ranking, similarity search, and RAG retrieval
+             ├─ Evidence verification, relevance filtering, scoring, ranking and RAG retrieval
              └─ HTTPS model requests → your fixed ngrok domain → Kaggle model API
                                                                 ├─ Qwen + LangChain
                                                                 └─ MiniLM embeddings
@@ -37,7 +38,7 @@ Browser → Streamlit on your computer
 |---|---|
 | Streamlit UI and document extraction | Language model and embedding model |
 | Persistent CV library and profile/vector caches | LangChain prompts, chains, and output parsers |
-| Keyword matching, scoring, similarity, and retrieval | Token-aware splitting for embedding inference |
+| Scoring, filtering, similarity, and retrieval | Query interpretation and candidate assessment |
 | Ranking, evidence validation, and exports | Stateless model API and ngrok Agent Endpoint |
 
 Kaggle stores no candidate library or search index. The local app loads no model weights
@@ -115,22 +116,29 @@ continuous hosting when the notebook stops.
 ## Models and scoring
 
 [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) extracts profiles
-and answers questions in 4-bit on Kaggle GPU 0.
+and answers questions, interprets searches, and assesses candidate evidence in 4-bit on Kaggle GPU 0.
 [Multilingual MiniLM](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2)
 embeds passages on Kaggle CPU. The profile chain uses **JsonOutputParser** with complete-JSON
 and field validation; the question chain uses **StrOutputParser**. RAG retrieval stays local.
 
-Required skills contribute 80% of coverage and preferred skills 20%; a single group gets
-the full weight. An optional role description uses embedding similarity to break equal-score
-ties. Coverage measures term presence, not proven proficiency. Review evidence and AI facts
-against the original wording, especially negated statements.
+The model turns your request into required/preferred skill and experience criteria. It
+assesses each CV against every criterion and produces an explanation with verbatim evidence.
+The local app verifies quotes, excludes irrelevant candidates or missing required evidence,
+and computes criteria coverage (required weight 2; preferred weight 1). Concrete project/work
+evidence breaks equal-coverage ties. Coverage is a review aid, not a proficiency or hiring score.
+
+`ros 2`, `ROS2`, and `ROS-2` are equivalent. Generic `ROS` is broad enough to include ROS 1
+or ROS 2; asking explicitly for ROS 2 requires evidence of that version. The model can also
+interpret related terminology; review **What the AI looked for** to check its interpretation.
+Model judgments can be wrong even when a quoted excerpt exists; review the explanation and source.
 
 ## Local storage and offline use
 
-Imports, browsing/removal, keyword search, skill ranking with an empty role description,
-and viewing cached profiles work without Kaggle. New profiles, semantic searches, questions,
-and role-description tie-breakers require model requests. A new query still needs embeddings,
-even if the CV embeddings are cached.
+Imports, browsing/removal and viewing/exporting cached profiles work without Kaggle.
+AI search, shortlisting, new profiles and questions require the model service. Search
+interpretations and assessments are cached locally for repeated criteria and unchanged CVs.
+A first search reviews every CV, which can take time; the UI shows progress. No candidates
+are silently excluded by a fixed retrieval or library-size cap.
 
 Local data survives app, browser, and Kaggle restarts. Back up `.data/` to preserve the library
 between machines. Set `ATS_DATA_DIR` privately to choose another storage folder. This is one
@@ -138,9 +146,9 @@ local workspace shared by browser sessions; separate recruiter accounts are not 
 
 PDF/DOCX/TXT imports support 10 MB and 30,000 extracted characters; PDFs support up to 30
 pages. Scanned/partly scanned or encrypted PDFs need preprocessing. Complex Word layouts
-can lose text. Analysis prompts above 7,000 model tokens are rejected; generated outputs
-are capped at 3,000 tokens. There is no fixed CV-count cap, but the simple local similarity
-scan suits a modest personal library.
+can lose text. Long CVs are processed in overlapping 2,200-token sections and merged;
+each generation has a 2,600-token output budget and one retry for invalid JSON. There is
+no fixed CV-count cap, but serial AI review suits a modest personal library.
 
 Original files stay local. Extracted text crosses ngrok only when inference needs it.
 Application code does not persist CVs on Kaggle; ngrok traffic inspection/provider retention
@@ -178,3 +186,11 @@ Regenerate the notebook after changing the model/API source or Kaggle dependency
 Tests download no models and contact no ngrok account; SDK lifecycle tests use a substitute
 listener. They do not prove domain ownership or GPU inference. Verify connectivity with
 Block 9 and `tools.check_connection`, then exercise the model workflows with your own PDFs.
+
+## Updating an existing installation
+
+This release requires **model API 4.0.0**. Keep your existing `.env`, ngrok domain, secrets
+and `.data/`. Replace the Kaggle notebook with the updated file. For the simplest update,
+restart the Kaggle session, run Block 1, restart the kernel if packages changed, then run
+Blocks 2–9. Restart Streamlit to load the dark theme and new client.
+See [the update instructions](docs/KAGGLE_GUIDE.md#updating-from-api-30).

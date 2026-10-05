@@ -100,7 +100,7 @@ Run the blocks in order. The first model download can take several minutes.
 | 2 | Read settings from Kaggle secrets and export SDK environment values | `Private settings loaded.` |
 | 3 | Define plain profile dictionaries and validation functions | Functions defined |
 | 4 | Load Qwen in 4-bit on GPU and MiniLM on Kaggle CPU | `Models ready.` |
-| 5 | Create embedding, analysis, and question functions/chains | `Chains ready.` |
+| 5 | Create embedding, profile, question, interpretation and assessment chains | `Chains ready.` |
 | 6 | Define the model API | API function defined |
 | 7 | Start FastAPI on Kaggle port 8000 | `Model API ready on port 8000.` |
 | 8 | Connect your fixed-domain ngrok endpoint | `Available at: https://<your-domain>` |
@@ -112,6 +112,11 @@ Keep Kaggle's existing PyTorch/CUDA installation. Block 1's dependencies come fr
 `requirements-kaggle.txt` and are embedded in the notebook, so the notebook needs no
 repository files uploaded. If already-imported packages conflict after installation,
 restart the kernel once and resume from Block 2.
+
+Block 1 uses `!{sys.executable} -m pip install ...`. The `!` runs a shell command;
+`sys.executable` selects the Python used by the notebook kernel. Run the cell once,
+then restart the kernel if already-imported packages changed. Do not replace Kaggle's
+PyTorch/CUDA installation.
 
 Block 9 checks the URL, authentication, and API availability; it does not generate a
 profile or prove model quality. Test the model workflows with your own CVs in Section 6.
@@ -222,7 +227,7 @@ macOS/Linux:
 .venv/bin/python -m streamlit run app.py
 ```
 
-The check should report `Connected to the Smart ATS model API (version 3.0.0).`
+The check should report `Connected to the Smart ATS model API (version 4.0.0).`
 It sends no CV and prints no credential. Open [localhost:8501](http://localhost:8501).
 
 Settings load privately; the recruiter sees only the candidate workspace. Restart Streamlit
@@ -233,15 +238,19 @@ after editing `.env`. There is no need to change the hostname after each Kaggle 
 1. Open **Candidates** and upload one or several CVs. Check each import result.
 2. Open a candidate and review **Preview document**. Confirm extracted text is readable
    before requesting AI analysis.
-3. In **Search**, choose **Skills & keywords** and search for terms you know appear in the
-   PDFs. Try matching all terms, then any term, and inspect supporting excerpts.
-4. In **Shortlist**, enter required and preferred skills. Leave the role description empty
-   initially. Check matched/missing terms and coverage against the source.
+3. In **Search**, describe skills and experience together, for example `Python and ros 2
+   with hands-on autonomous navigation experience`. Add explicit required skills if needed.
+   Check **What the AI looked for**, **Why this candidate matters**, and **CV evidence**.
+   A CV listing ROS 2 without navigation work should not pass this request. A web developer
+   should not appear merely because Python is present.
+4. In **Shortlist**, enter required/preferred skills and a role/experience description.
+   Compare coverage and the explanations. Required gaps exclude a CV; preferred gaps are shown.
 5. Open **Candidate profile** and click **Prepare profile**. This invokes Qwen; generation
    may take a minute or more on a small GPU. Verify the professional details and JSON export.
 6. Ask a question about that candidate's experience. Check the numbered source passages.
-7. Try **Experience & meaning** search and a role-description tie-breaker. These invoke
-   embedding inference, while similarity and ranking calculations remain local.
+7. Repeat a search with `ros2`, `ROS 2`, and generic `ROS`. The first two mean the same
+   version; generic ROS covers the broader ecosystem. Confirm an explicit ROS 2 search
+   does not admit a CV stating only ROS 1. Repeat the same query to check local cache reuse.
 
 No test CV files are shipped or inserted into your library. Automated checks use synthetic
 text defined inside the test module; it never becomes product data.
@@ -256,17 +265,26 @@ running on Kaggle CPU. LangChain splits embedding inputs into 100-token passages
 
 Profile chain: `prompt | model | complete JSON check | JsonOutputParser | validation`.
 Question chain: `prompt | model | StrOutputParser`.
-They use ordinary functions and dictionaries, with one retry for invalid profile JSON.
+Search chains: `prompt | model | complete JSON check | JsonOutputParser | validation`.
+They use ordinary functions and dictionaries, with one retry for invalid JSON.
 Structural validation does not guarantee factual accuracy; review the original wording.
 
 Questions use local RAG: request embeddings, cache CV vectors locally, calculate cosine
 similarity against the selected CV only, retrieve up to four passages, and send those
 passages plus the question to the model API. Kaggle has no vector store or retrieval logic.
 
-Required skill coverage contributes 80%, preferred coverage 20%; a single group gets full
-weight. A role description uses similarity to break equal-coverage ties. Term presence
-does not prove proficiency; negated terms can match. Semantic results are relative matches,
-not qualification scores or automatic hiring decisions.
+Search has two model steps. First Qwen interprets the request into skill and experience
+criteria. Next it assesses each CV, returning `met`, `partial` or `not_found`, a prose reason,
+and supporting quotes for each criterion. It distinguishes a listed skill from practical
+work and must respect negation and numeric constraints; unstated experience remains uncertain.
+The local app checks the quotes, excludes irrelevant CVs and any unmet required criterion,
+then scores coverage with weight 2 for required criteria and 1 for preferred criteria.
+Concrete experience evidence breaks ties. There is no embedding-score threshold presented
+as proof of relevance. AI interpretation and reasoning can still be wrong; inspect the source.
+
+Long CVs are processed in 2,200-token sections with 100-token overlap. Profiles merge all
+section outputs; review notes flag possible overlapping entries. Assessment combines the
+strongest supported status per criterion without promoting partial evidence to a full match.
 
 ## 7. Stop and restart
 
@@ -291,19 +309,21 @@ library; separate recruiter accounts are not implemented.
 | Works when Kaggle is stopped | Requires Kaggle online |
 |---|---|
 | Import, preview, browse, remove, or clear CVs | Prepare new AI profiles |
-| Keyword/skill search | Semantic search |
-| Skill ranking with an empty role description | New question embeddings and answers |
-| View/export cached profiles and local results | Role-description similarity tie-breakers |
+| View/export cached profiles and existing local results | AI search and shortlisting |
+| Cached extracted candidate details | New question embeddings and answers |
 
-Cached CV embeddings are reused, but a new question/search still requires a query embedding.
+Cached CV embeddings are reused, but a new question still requires a query embedding.
+Search interpretations and candidate assessments are also cached locally; an unchanged
+request reuses them. The service must be online to start the AI workflow.
 Changing embedding versions rebuilds affected local caches. Kaggle/app/browser restarts do
 not erase the local library. Removal clears that CV's text, profile, and vectors locally.
 
 Documents may be up to 10 MB and 30,000 extracted characters; PDFs may have up to 30 pages.
 Scanned/partly scanned and encrypted PDFs need preprocessing. Complex Word layouts may
-lose text. Analysis prompts above 7,000 model tokens are rejected; outputs are capped at
-3,000 tokens. Shorten unusually long CVs if needed. There is no fixed CV-count cap; the
-simple local similarity scan is intended for a modest personal collection.
+lose text. Each generation has a 2,600-token output budget and one retry for malformed
+JSON; incomplete output is rejected rather than silently repaired. Long CVs use multiple
+generations. There is no fixed CV-count cap; the serial AI review is intended for a modest
+personal collection. First searches and long-CV profiles can take several minutes.
 
 Original files stay local; text crosses ngrok when a model operation needs it. Application
 code does not persist CVs on Kaggle. Review ngrok traffic inspection and provider retention
@@ -320,11 +340,12 @@ ignored by Git; keep credentials and documents private.
 | API unreachable or ngrok endpoint offline | Keep Kaggle alive; confirm Blocks 7–9 completed |
 | Connection still uses an old URL | Remove/update `ATS_API_URL` in `.env`; it overrides `NGROK_DOMAIN` |
 | AI access cannot be verified | Local `ATS_API_KEY` must exactly match the Kaggle secret |
-| AI needs an update | Use this notebook; the local app expects API version `3.0.0` |
+| AI needs an update | Use this notebook; the local app expects API version `4.0.0` |
 | Secret lookup fails | Check exact names and enable notebook access to all three secrets |
 | GPU/download error | Enable GPU/Internet and check Kaggle availability/quota |
 | GPU memory error | Restart the kernel to unload old models; avoid loading the model twice |
-| Profile cannot be prepared | Inspect extracted text, retry, or shorten the CV |
+| Profile/server request fails | Match the error reference in the app to the Kaggle output. Error class and stack frames identify the failing operation without logging candidate text or credentials |
+| Invalid/incomplete model JSON | One retry is automatic; fenced JSON and unknown text details are supported. Retry or inspect the extracted document if failure persists |
 | PDF needs OCR | Convert scanned pages to searchable text before importing |
 | Local library cannot open | Ensure `.data/` or the configured folder is writable |
 | ngrok quota error | Check the account's current usage and plan limits in the dashboard |
@@ -345,3 +366,20 @@ Tests use deterministic model substitutes and a fake SDK listener, so they need 
 ngrok credential, or candidate files. They verify local workflows and notebook behavior;
 your account's domain and real model inference are verified with the steps above.
 See [the model API contract](API.md) for request details.
+
+## Updating from API 3.0
+
+Keep your domain and all three secrets. Keep local `.env` and `.data/`; the app adds a
+cache table automatically and preserves every saved CV/profile.
+
+1. Stop the old notebook API/tunnel with its Block 10.
+2. Replace the notebook with this repository's updated `smart_ats_kaggle.ipynb`.
+3. Restart the Kaggle session for a clean installation. Run Block 1, restart the kernel
+   if imports changed, then run Blocks 2–9. Block 9 must report API `4.0.0`.
+4. Restart Streamlit with the usual command to load the new dark theme and client.
+5. Test profile preparation, a combined robotics search, an irrelevant CV, and shortlisting.
+
+If the models are already loaded and dependencies have not changed, you can stop the old
+server/tunnel, replace Blocks 3, 5 and 6, run those updated blocks, then run Blocks 7–9.
+Do not reload Block 4 into an already populated GPU unnecessarily. The new endpoints are
+`/interpret` and `/evaluate`; both perform model inference only.

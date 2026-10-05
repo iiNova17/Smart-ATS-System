@@ -1,86 +1,131 @@
-# Kaggle model API · version 3.0.0
+# Kaggle model API · version 4.0.0
 
-Set `NGROK_DOMAIN` and `ATS_API_KEY` in local `.env`. The app builds the HTTPS base URL
-from your account's domain. An optional `ATS_API_URL` overrides it for development.
-The app calls this API only for
-model inference; candidate storage, extraction, search, ranking, and RAG retrieval are local.
-There is no session header or remote CV collection. All requests authenticate with
-`Authorization: Bearer <ATS_API_KEY>` and send `ngrok-skip-browser-warning: true`.
-Use the same domain as Kaggle's `NGROK_DOMAIN` secret. Notebook Block 8 opens its Agent
-Endpoint with the official `ngrok` Python SDK. Local HTTP is supported for tests.
+The API performs model inference and LangChain parsing only. Candidate storage, uploads,
+source verification, filtering, scoring, ranking, RAG retrieval and exports run locally.
+No candidate library, vector store or search/rank endpoints exist on Kaggle.
+
+All requests use `Authorization: Bearer <ATS_API_KEY>` and
+`ngrok-skip-browser-warning: true`. The app derives the HTTPS base URL from your private
+`NGROK_DOMAIN`; `ATS_API_URL` optionally overrides it for development. The notebook and
+app must both use API **4.0.0**. No session header or candidate ID is sent.
 
 | Method | Endpoint | Input | Output |
 |---|---|---|---|
-| GET | `/health` | No body | `{status: "ok", version: "3.0.0"}` |
-| POST | `/embed` | `{texts: [string, ...]}` | `{embedding_version, items: [{vector, chunks: [{text, vector}]}]}` |
+| GET | `/health` | No body | `{status: "ok", version: "4.0.0"}` |
+| POST | `/interpret` | `{query: string}` | `{criteria: {intent, requirements}}` |
+| POST | `/evaluate` | `{text: string, criteria: object}` | `{assessment: {name, headline, relevant, explanation, assessments}}` |
 | POST | `/analyze` | `{text: string}` | `{analysis: profile_dictionary}` |
+| POST | `/embed` | `{texts: [string, ...]}` | `{embedding_version, items: [{vector, chunks: [{text, vector}]}]}` |
 | POST | `/answer` | `{question: string, passages: [string, ...]}` | `{answer: string}` |
 
-The previous `/cvs`, `/search`, `/rank`, and per-CV analysis/question routes are removed.
-Use the updated notebook and app together; the app expects version `3.0.0`.
+## Search interpretation
 
-## Embeddings
-
-```json
-{"texts": ["Skills: Python, SQL. Built document search using LangChain."]}
-```
-
-LangChain splits each input into 100-token passages with 20-token overlap and embeds
-them using multilingual MiniLM. `chunks` contains those passage texts and vectors;
-`vector` is the normalized average of their vectors, used for queries/descriptions.
-No index is created or retained on Kaggle. The local app caches the returned passages
-and vectors, checks model version/dimensions, and calculates similarity locally.
-
-A single request accepts one to eight texts, each 1–30,000 characters. The app batches
-CV requests in groups of four. This request-size safeguard is independent of library size:
-there is no fixed total CV cap. The embedding version includes the model and chunk settings;
-change it if you change the embedding model, preprocessing, or splitting configuration.
-
-## Profile extraction
-
-```json
-{"text": "Alex Example. Skills: Python, SQL. Built document search at Example Labs."}
-```
-
-The analysis chain reads the supplied CV, generates complete JSON, and validates the
-dictionary's field types. Missing fields receive null/empty defaults. The response includes
-contact details, summary, skills, experience, education, projects, certifications,
-languages, achievements, links, other details, evidence, and review notes.
-The local app checks evidence quotes against the source and persists the profile locally.
-No candidate ID or filename is needed. Input: 40–30,000 characters; the model additionally
-rejects prompts above 7,000 tokens. Output: at most 3,000 generated tokens, with one retry
-for malformed JSON. Structure validation does not guarantee factual accuracy.
-
-## Answers from retrieved passages
+`/interpret` accepts 1–6,000 characters. Qwen combines keywords, technical skills and
+experience requirements; aliases and spelling variations are interpreted in context.
+An explicit ROS 2 request requires that version; generic ROS covers the broader ecosystem.
+The prompt must not invent extra requirements. OR alternatives remain one criterion.
 
 ```json
 {
-  "question": "Which skills are stated?",
-  "passages": ["Skills: Python, SQL, LangChain.", "Built document search using RAG."]
+  "criteria": {
+    "intent": "Python and ROS 2 with practical autonomous navigation experience",
+    "requirements": [
+      {"label": "Python", "kind": "skill", "required": true},
+      {"label": "ROS 2", "kind": "skill", "required": true},
+      {"label": "autonomous navigation experience", "kind": "experience", "required": true}
+    ]
+  }
 }
 ```
 
-The local app selects passages from the chosen CV before making this call. Kaggle formats
-them as `[Passage 1]`, `[Passage 2]`, etc., and invokes the question chain. The prompt
-requests grounded answers with passage citations and an explicit missing-information response.
-The local UI displays the supplied passages for review. No retrieval runs on Kaggle.
+Requirements contain a label, `kind` (`skill` or `experience`) and a Boolean `required`.
+The local app preserves explicit required/preferred form entries even if interpretation
+omits them. The user can inspect the interpreted criteria in the results.
 
-Questions accept 1–1,000 characters. Supply one to four passages, each 1–6,000 characters;
-the combined prompt still must fit the model token limit. The API trusts the caller to
-select the correct candidate's passages. The shipped local app scopes retrieval by CV ID.
+## Candidate assessment
 
-## Local operations
+`/evaluate` accepts a CV (40–30,000 characters) plus validated criteria. It returns model
+reasoning about one supplied text; it never fetches candidates, filters a library or assigns
+rank positions. Every criterion must have an assessment using its zero-based index.
 
-`ats/workspace.py` contains plain functions for SQLite persistence, CRUD, keyword search,
-coverage ranking, local cosine similarity, scoped retrieval, cached profile analysis, and
-question orchestration. SQLite data defaults to `.data/candidates.sqlite3`; optionally set
-`ATS_DATA_DIR` privately. No model weights or LangChain dependencies load in the local app.
+```json
+{
+  "assessment": {
+    "relevant": true,
+    "explanation": "The navigation project connects ROS 2 to practical robot work.",
+    "assessments": [
+      {"index": 0, "status": "met", "depth": "applied",
+       "reason": "The mapping project uses Python for practical robotics work.",
+       "quotes": ["Implemented indoor mapping in Python with SLAM."]}
+    ]
+  }
+}
+```
 
-Upload, library operations, keyword search, and skill ranking with no role description
-make **zero API calls**. New profiles, semantic searches, questions, and optional description
-tie-breakers need inference. Cached profiles remain available offline.
+The example shows one criterion; real output must cover every supplied criterion.
+`status` is `met`, `partial` or `not_found`. `depth` is `listed`, `applied` or `extensive`
+according to concrete CV evidence. `reason` connects source facts to the request; the
+separate `quotes` list holds verbatim evidence. A skill mention alone cannot prove hands-on
+experience, seniority or years. Numeric experience constraints require clearly stated
+relevant durations; the model must not infer years from overlapping jobs.
 
-Errors: 401 for invalid key, 422 for invalid input/output structure, 503 for model failures.
-Remote failures do not clear the local library. HTTP errors omit internal exception details.
-This service uses a shared project API key and is intended for a private local workspace.
-It does not implement user accounts or multiuser data isolation.
+The local app checks quotes against the CV and enforces explicit ROS-version evidence.
+An unsupported quote cannot establish a match. Irrelevant CVs and unmet/partial required
+criteria are excluded. Remaining candidates are ordered locally by weighted criteria
+coverage (required 2, preferred 1; met 1, partial 0.5, not_found 0), then evidence depth.
+The score measures criteria coverage, not proficiency or hiring probability.
+Interpretations and assessments are cached in local SQLite by request/CV content and
+prompt version. A first search reviews every CV; there is no silent top-k candidate cutoff.
+Structural and quote validation cannot independently prove the model's reasoning correct.
+
+## Profiles and JSON parsing
+
+`/analyze` extracts contact details, summary, skills, experience, education, projects,
+certifications, languages, achievements, links, other professional details, evidence and
+review notes. Unknown fields use null/empty defaults. Fenced JSON is accepted; incomplete
+JSON is rejected. Unknown nested text values may be null; explicitly stated numeric years
+are stored as text. The local app checks quotes and persists profiles.
+
+Analysis and assessment split long CVs into overlapping 2,200-token sections with 100-token
+overlap, processing every section. Profile facts are merged without inferring new facts;
+review notes flag potential overlapping entries. Assessments retain the strongest supported
+status for each criterion. Partial evidence is never promoted to met during merging.
+Each generation has a 2,600-token output budget, with one retry for invalid JSON.
+The local client allows up to 15 minutes for section-based profile/assessment requests.
+
+Chains use familiar LangChain composition:
+
+```text
+Interpret / assess / profile: prompt | model | complete JSON check | JsonOutputParser | validation
+Question:                    prompt | model | StrOutputParser
+```
+
+## Embeddings and local RAG
+
+`/embed` accepts one to eight texts, each 1–30,000 characters. Multilingual MiniLM runs on
+Kaggle CPU. LangChain splits inputs into 100-token passages with 20-token overlap. The API
+returns passages, vectors and a normalized average; it retains no index. The embedding
+version identifies model and chunk settings. The local app caches vectors, checks version
+and dimensions, and computes cosine similarity locally.
+
+`/answer` accepts a question (1–1,000 characters) and one to four locally retrieved passages,
+each 1–6,000 characters. The model answers using the supplied facts and cites `[Passage N]`.
+The app scopes retrieval to the selected CV before sending passages. Embedding similarity
+is used for question retrieval, while search relevance comes from explicit AI assessment.
+
+## Failures and privacy
+
+401 means an invalid API key; 422 means invalid input or model output; 503 means a model
+runtime failure. A 503 contains a safe message, code and error reference:
+
+```json
+{"detail": {"message": "The model could not finish this request. Check the Kaggle error reference.",
+            "code": "model_error", "reference": "12ab34cd"}}
+```
+
+Match the reference to the Kaggle cell output. Logs contain operation name, exception
+class and stack frames, not CV text, keys, model output or arbitrary exception messages.
+GPU out-of-memory errors have a specific restart message. Failures preserve local CVs.
+Application code stores no candidate data on Kaggle. Provider/ngrok retention and traffic
+inspection are separate settings. This is one private workspace using a shared project
+key; separate user accounts and multiuser isolation are not implemented.

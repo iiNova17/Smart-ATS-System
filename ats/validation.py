@@ -65,8 +65,8 @@ def validate_rank(payload):
     preferred = [
         skill for skill in preferred if skill.casefold() not in {x.casefold() for x in required}
     ]
-    if not required and not preferred:
-        raise ValueError("Add at least one required or preferred skill.")
+    if not required and not preferred and not payload.get("job_description", "").strip():
+        raise ValueError("Add skills or describe the experience your role needs.")
     return {
         "required": required,
         "preferred": preferred,
@@ -77,17 +77,93 @@ def validate_rank(payload):
 
 
 def validate_search(payload):
-    query = validate_text(payload.get("query"), "Search", 1, 6000)
+    required = clean_skills(payload.get("required", []))
+    query = payload.get("query") or ", ".join(required)
+    if not query:
+        raise ValueError("Describe the skills or experience you need, or add a required skill.")
+    query = validate_text(query, "Search", 1, 6000)
     mode, match, limit = (
-        payload.get("mode", "keyword"),
+        payload.get("mode", "smart"),
         payload.get("match", "all"),
         payload.get("limit"),
     )
-    if mode not in {"keyword", "semantic"} or match not in {"all", "any"}:
+    if mode not in {"smart", "keyword", "semantic"} or match not in {"all", "any"}:
         raise ValueError("Choose a valid search method and match rule.")
     if limit is not None and (type(limit) is not int or limit < 1):
         raise ValueError("Result count must be a positive integer.")
-    return {"query": query, "mode": mode, "match": match, "limit": limit}
+    return {
+        "query": query,
+        "mode": mode,
+        "match": match,
+        "limit": limit,
+        "required": required,
+    }
+
+
+def validate_criteria(value):
+    """A small, readable schema for the model's interpretation of a request."""
+    if not isinstance(value, dict):
+        raise ValueError("AI returned an invalid search interpretation.")
+    intent = validate_text(value.get("intent"), "Search intent", 1, 6000)
+    requirements = value.get("requirements")
+    if not isinstance(requirements, list) or not 1 <= len(requirements) <= 60:
+        raise ValueError("AI must return the requirements in your request.")
+    clean = []
+    for item in requirements:
+        if not isinstance(item, dict):
+            raise ValueError("Invalid search requirement.")
+        label = validate_text(item.get("label"), "Requirement", 1, 300)
+        kind, required = item.get("kind"), item.get("required")
+        if kind not in {"skill", "experience"} or type(required) is not bool:
+            raise ValueError("Invalid requirement type.")
+        clean.append({"label": label, "kind": kind, "required": required})
+    return {"intent": intent, "requirements": clean}
+
+
+def validate_assessment(value, criteria):
+    if not isinstance(value, dict) or type(value.get("relevant")) is not bool:
+        raise ValueError("AI returned an invalid candidate assessment.")
+    explanation = validate_text(value.get("explanation"), "Match explanation", 1, 2400)
+    assessments = value.get("assessments")
+    if not isinstance(assessments, list) or len(assessments) != len(criteria["requirements"]):
+        raise ValueError("AI must assess every requirement, including missing evidence.")
+    clean, seen = [], set()
+    for item in assessments:
+        if not isinstance(item, dict):
+            raise ValueError("Invalid requirement assessment.")
+        index, status = item.get("index"), item.get("status")
+        if type(index) is not int or not 0 <= index < len(assessments) or index in seen:
+            raise ValueError("AI returned incorrect requirement indices.")
+        if status not in {"met", "partial", "not_found"}:
+            raise ValueError("Invalid evidence status.")
+        depth = item.get("depth", "listed")
+        if depth not in {"listed", "applied", "extensive"}:
+            raise ValueError("Invalid experience evidence depth.")
+        quotes = item.get("quotes", [])
+        if not isinstance(quotes, list) or len(quotes) > 4:
+            raise ValueError("Invalid supporting evidence.")
+        quotes = [validate_text(quote, "Evidence quote", 1, 1600) for quote in quotes]
+        clean.append(
+            {
+                "index": index,
+                "status": status,
+                "depth": depth,
+                "reason": validate_text(item.get("reason"), "Reason", 1, 1000),
+                "quotes": quotes,
+            }
+        )
+        seen.add(index)
+    return {
+        "relevant": value["relevant"],
+        "name": validate_text(value["name"], "Candidate name", 1, 200)
+        if value.get("name")
+        else None,
+        "headline": validate_text(value["headline"], "Headline", 1, 200)
+        if value.get("headline")
+        else None,
+        "explanation": explanation,
+        "assessments": sorted(clean, key=lambda item: item["index"]),
+    }
 
 
 def fill_fields(value, template):
@@ -96,6 +172,9 @@ def fill_fields(value, template):
     result = deepcopy(template)
     for key, item in value.items():
         default = template[key]
+        # JSON null is a common, valid representation of an unknown text detail.
+        if item is None and isinstance(default, str):
+            item = default
         if default is None:
             valid = item is None or isinstance(item, str)
         elif isinstance(default, list):
@@ -109,6 +188,8 @@ def fill_fields(value, template):
 
 
 def validate_analysis(value):
+    if isinstance(value, dict) and type(value.get("stated_years_experience")) in {int, float}:
+        value = {**value, "stated_years_experience": str(value["stated_years_experience"])}
     result = fill_fields(value, PROFILE_TEMPLATE)
     for key, items in result.items():
         if not isinstance(items, list):

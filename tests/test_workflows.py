@@ -27,6 +27,7 @@ from ats.workspace import (
     open_workspace,
     rank_cvs,
     remove_cv,
+    retrieve,
     search_cvs,
 )
 from backend.api import create_app
@@ -61,7 +62,42 @@ def make_test_runtime(state=None):
             )
         return {"embedding_version": state["version"], "items": items}
 
+    def interpret(query):
+        labels = [
+            skill
+            for skill in ["Python", "SQL", "LangChain", "RAG", "Java", "Docker"]
+            if skill.casefold() in query.casefold()
+        ]
+        return {
+            "intent": query,
+            "requirements": [
+                {"label": label, "kind": "skill", "required": True} for label in labels
+            ],
+        }
+
+    def evaluate(text, criteria):
+        items = []
+        for index, requirement in enumerate(criteria["requirements"]):
+            quote = skill_evidence(text, requirement["label"])
+            items.append(
+                {
+                    "index": index,
+                    "status": "met" if quote else "not_found",
+                    "reason": "The documented work supports this requirement."
+                    if quote
+                    else "This requirement is not stated in the CV.",
+                    "quotes": [quote] if quote else [],
+                }
+            )
+        return {
+            "relevant": any(item["status"] == "met" for item in items),
+            "explanation": "This candidate's documented software work fits the requested skills.",
+            "assessments": items,
+        }
+
     return {
+        "interpret_query": interpret,
+        "evaluate_text": evaluate,
         "embed_texts": embed,
         "answer_question": lambda context, question: context,
         "analyze_text": lambda text: {
@@ -120,8 +156,8 @@ def test_boundary_matching_and_punctuation():
     assert skill_evidence("Ｐｙｔｈｏｎ", "python") == "Ｐｙｔｈｏｎ"
 
 
-def test_local_rank_deduplication_missing_evidence_and_weights(tmp_path):
-    workspace = open_workspace(tmp_path / "data")
+def test_ai_rank_requires_supported_required_skills(connected_workspace):
+    workspace, calls, state = connected_workspace
     add_cv(workspace, {"filename": "maya.txt", "text": SAMPLE})
     add_cv(
         workspace,
@@ -134,9 +170,10 @@ def test_local_rank_deduplication_missing_evidence_and_weights(tmp_path):
         workspace, {"required": ["Python", "SQL", " python "], "preferred": ["SQL", "RAG"]}
     )
     assert rows[0]["score"] == 100
-    assert rows[1]["score"] == 40
-    assert rows[1]["missing_required"] == ["SQL"]
-    assert rows[1]["missing_preferred"] == ["RAG"]
+    assert len(rows) == 1
+    assert rows[0]["rank"] == 1
+    assert rows[0]["reasons"]
+    assert {call["path"] for call in calls} == {"/interpret", "/evaluate"}
     assert coverage_score(0, 2, 0, 1) == 50
     assert coverage_score(2, 0, 1, 0) == 50
     with pytest.raises(ValueError):
@@ -151,9 +188,15 @@ def test_offline_upload_search_rank_persist_and_delete_without_api(tmp_path):
     workspace = open_workspace(directory, forbidden_client)
     cv = add_cv(workspace, {"filename": "first.txt", "text": SAMPLE})["cv"]
     assert add_cv(workspace, {"filename": "renamed.txt", "text": SAMPLE})["duplicate"]
-    assert search_cvs(workspace, {"query": "Python, absent", "match": "all"}) == []
-    assert len(search_cvs(workspace, {"query": "Python, absent", "match": "any"})) == 1
-    assert rank_cvs(workspace, {"required": ["Python"]})[0]["score"] == 100
+    assert (
+        search_cvs(workspace, {"query": "Python, absent", "mode": "keyword", "match": "all"}) == []
+    )
+    assert (
+        len(search_cvs(workspace, {"query": "Python, absent", "mode": "keyword", "match": "any"}))
+        == 1
+    )
+    with pytest.raises(BackendError):
+        rank_cvs(open_workspace(directory), {"required": ["Python"]})
     reloaded = open_workspace(directory, forbidden_client)
     assert get_cv(reloaded, cv["id"])["text"] == SAMPLE.strip()
     remove_cv(reloaded, cv["id"])
@@ -162,8 +205,8 @@ def test_offline_upload_search_rank_persist_and_delete_without_api(tmp_path):
         get_cv(workspace, cv["id"])
 
 
-def test_local_library_has_no_fixed_candidate_or_search_cap(tmp_path):
-    workspace = open_workspace(tmp_path)
+def test_local_library_has_no_fixed_candidate_or_search_cap(connected_workspace):
+    workspace, calls, state = connected_workspace
     for i in range(105):
         add_cv(
             workspace, {"filename": f"cv_{i}.txt", "text": SAMPLE + f"\nCandidate reference {i}."}
@@ -212,7 +255,7 @@ def test_model_api_is_authenticated_stateless_and_inference_only():
     client = TestClient(create_app(KEY, make_test_runtime()))
     headers = {"Authorization": "Bearer " + KEY}
     assert client.get("/health").status_code == 401
-    assert client.get("/health", headers=headers).json()["version"] == "3.0.0"
+    assert client.get("/health", headers=headers).json()["version"] == "4.0.0"
     assert client.get("/cvs", headers=headers).status_code == 404
     assert client.post("/search", headers=headers, json={"query": "Python"}).status_code == 404
     assert client.post("/rank", headers=headers, json={"required": ["Python"]}).status_code == 404
@@ -283,11 +326,11 @@ def test_similarity_and_rag_are_local_and_cached(connected_workspace):
     second = "Different candidate. Skills: Java, Docker. Built Java services and Java projects."
     add_cv(workspace, {"filename": "second.txt", "text": second})
     results = search_cvs(workspace, {"query": "Python", "mode": "semantic"})
-    assert len(results) == 2 and results[0]["id"] == cv_id
-    assert [call["path"] for call in calls] == ["/embed", "/embed"]
+    assert len(results) == 1 and results[0]["id"] == cv_id
+    assert [call["path"] for call in calls] == ["/interpret", "/evaluate", "/evaluate"]
     count = len(calls)
     search_cvs(workspace, {"query": "Python", "mode": "semantic"})
-    assert len(calls) == count + 1  # Only the new query is embedded.
+    assert len(calls) == count  # Interpretation and assessments are cached locally.
     answer = ask_cv(workspace, cv_id, "Python projects?")
     assert all("Different candidate" not in passage for passage in answer["passages"])
     assert calls[-1]["path"] == "/answer"
@@ -303,10 +346,10 @@ def test_similarity_and_rag_are_local_and_cached(connected_workspace):
 def test_embedding_model_change_rebuilds_local_cache(connected_workspace):
     workspace, calls, state = connected_workspace
     add_cv(workspace, {"filename": "maya.txt", "text": SAMPLE})
-    search_cvs(workspace, {"query": "Python", "mode": "semantic"})
+    retrieve(workspace, "Python")
     state["version"] = "test-embedding-v2"
     calls.clear()
-    search_cvs(workspace, {"query": "Python", "mode": "semantic"})
+    retrieve(workspace, "Python")
     assert len(calls) == 2
     assert calls[1]["payload"]["texts"] == [SAMPLE.strip()]
 
@@ -329,8 +372,8 @@ def test_description_ranking_calls_embeddings_only(connected_workspace):
     rows = rank_cvs(
         workspace, {"required": ["Python", "SQL"], "job_description": "Python and RAG projects"}
     )
-    assert rows[0]["score"] == 100 and rows[0]["semantic_similarity"] is not None
-    assert all(call["path"] == "/embed" for call in calls)
+    assert rows[0]["score"] == 100 and rows[0]["explanation"]
+    assert {call["path"] for call in calls} == {"/interpret", "/evaluate"}
 
 
 def test_csv_export_neutralizes_formulas():
@@ -413,29 +456,29 @@ def test_connection_check_reports_health_without_cv_or_credentials(connected_wor
     assert "Connected" in output and KEY not in output
 
 
-def test_product_ui_upload_library_search_rank_do_not_contact_models(connected_workspace):
+def test_product_ui_upload_is_local_search_and_rank_use_models(connected_workspace):
     workspace, calls, state = connected_workspace
     add_cv(workspace, extract_cv("maya.txt", SAMPLE.encode()).model_dump())
     app = AppTest.from_file(str(ROOT / "app.py"), default_timeout=20).run()
     assert not app.exception and calls == []
-    assert app.metric[0].value == "1"
+    assert any("Candidates · 1" in heading.value for heading in app.subheader)
     assert not app.radio
     assert not any(widget.label in {"API URL", "API key", "Backend"} for widget in app.text_input)
     assert all("Capacity" not in metric.label for metric in app.metric)
     app.button(key="nav_search_candidates").click().run()
     next(
-        widget for widget in app.text_input if widget.label == "What are you looking for?"
+        widget for widget in app.text_area if widget.label == "What are you looking for?"
     ).set_value("Python, LangChain")
     next(button for button in app.button if button.label == "Find candidates").click().run()
     assert len(app.session_state["search_results"]["rows"]) == 1
     app.button(key="nav_rank_candidates").click().run()
-    next(widget for widget in app.text_area if widget.label == "Required skills").set_value(
+    next(widget for widget in app.text_input if widget.label == "Required skills").set_value(
         "Python, SQL"
     )
     next(button for button in app.button if button.label == "Create shortlist").click().run()
     assert not app.exception
     assert app.session_state["rank_results"]["rows"][0]["score"] == 100
-    assert calls == []
+    assert {call["path"] for call in calls} == {"/health", "/interpret", "/evaluate"}
 
 
 def test_product_profile_and_question_form(connected_workspace):
@@ -461,15 +504,17 @@ def test_unconfigured_product_stays_usable_and_reports_only_ai_failure(monkeypat
     assert not any("Demo" in b.label or "Connect" in b.label for b in app.button)
     assert not any(t.label in {"API URL", "API key"} for t in app.text_input)
     assert not app.info and not app.error
-    assert app.metric[0].value == "0"
+    assert any("Candidates · 0" in heading.value for heading in app.subheader)
 
 
 def test_notebook_is_standalone_compiles_and_contains_only_inference():
     notebook = json.loads((ROOT / "notebooks/smart_ats_kaggle.ipynb").read_text(encoding="utf-8"))
     blocks = ["".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code"]
     assert len(blocks) == 10
+    assert 'response.json()["version"] == "4.0.0"' in blocks[6]
+    assert 'response.json()["version"] == "4.0.0"' in blocks[8]
     for i, source in enumerate(blocks):
-        if source.startswith("%pip"):
+        if "!{sys.executable} -m pip" in source:
             continue
         tree = ast.parse(source)
         assert not any(isinstance(node, ast.ClassDef) for node in ast.walk(tree))
