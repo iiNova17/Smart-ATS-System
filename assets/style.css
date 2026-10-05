@@ -1,0 +1,65 @@
+/* A quiet, professional talent workspace built on native Streamlit controls. */
+.block-container {max-width: 1400px; padding: 4rem 3rem 3rem;}
+[data-testid="stAppViewContainer"] {background: #F5F7F6;}
+[data-testid="stHeader"] {background: rgba(245,247,246,.92);}
+[data-testid="stAppDeployButton"], [data-testid="stMainMenu"] {display: none;}
+[data-testid="stSidebar"] {background: #153B35; border-right: 0;}
+[data-testid="stSidebar"] .stButton button {
+ width: 100%; justify-content: flex-start; padding: .78rem 1rem; border-radius: 9px;
+ color: #D8E6E1; background: transparent; border: 1px solid transparent; font-weight: 550;
+}
+[data-testid="stSidebar"] .stButton button:hover {background: #254B44; color: #FFFFFF;}
+[data-testid="stSidebar"] .stButton button[kind="primary"] {
+ background: #E4F1E9; color: #173F36; border-color: #E4F1E9;
+}
+[data-testid="stSidebar"] .stButton button p {color: inherit;}
+.brand {display: flex; align-items: center; gap: 12px; margin: 20px 0 48px;}
+.brand-mark {display: grid; place-items: center; width: 42px; height: 42px; background: #D0E9DB;
+ color: #174135; border-radius: 12px; font-size: 21px; font-weight: 750;}
+.brand-name {color: #FFFFFF; font-size: 23px; font-weight: 700; letter-spacing: -.04em;}
+.brand-sub {color: #B3C9C0; font-size: 12px; margin-top: -2px;}
+.sidebar-section {color: #A3BFB3; font-size: 10px; font-weight: 650; letter-spacing: .13em; margin-bottom: 15px;}
+.sidebar-note {margin-top: 100px; border-top: 1px solid #36574B; padding-top: 24px;}
+.sidebar-note p {color: #B8CEC4; font-size: 13px; line-height: 1.8;}
+.workspace-top {display: flex; align-items: center; justify-content: space-between; margin: 0 0 20px;}
+.eyebrow {font-size: 10px; font-weight: 650; letter-spacing: .13em; color: #60766C;}
+.workspace-tag {font-size: 11px; color: #426756; border: 1px solid #D3E3D9; border-radius: 20px; padding: 5px 11px;}
+h1, h2, h3 {letter-spacing: -.035em; color: #193C31;}
+h1 {font-size: 2.1rem !important; font-weight: 680 !important; padding-bottom: .35rem !important;}
+h3 {font-size: 1.25rem !important; font-weight: 630 !important;}
+[data-testid="stCaptionContainer"] {color: #617269;}
+[data-testid="stMetric"] {background: white; border: 1px solid #E0E7E2; padding: 17px 21px; border-radius: 12px; margin: 16px 0 24px;}
+[data-testid="stMetricLabel"] {color: #62766A; font-size: 13px;}
+[data-testid="stMetricValue"] {font-size: 1.85rem; font-weight: 650; color: #193C31;}
+[data-testid="stVerticalBlockBorderWrapper"] {border-color: #DEE6DF !important; border-radius: 12px; background: white;}
+[data-testid="stButton"] button, [data-testid="stDownloadButton"] button {border-radius: 8px; font-weight: 550;}
+[data-testid="stForm"] {background: #FFFFFF; border-color: #DEE6DF; border-radius: 12px;}
+[data-testid="stExpander"] {border-color: #DEE6DF; background: white; border-radius: 10px;}
+[data-testid="stFileUploaderDropzone"] {background: #F5F8F5; border: 1px dashed #C5D6C8; border-radius: 10px;}
+.card-eyebrow {font-size: 9px; font-weight: 700; letter-spacing: .12em; color: #5B7B63; margin: 2px 0 8px;}
+.import-note {border-top: 1px solid #E5EBE6; margin-top: 25px; padding-top: 20px;}
+.import-note strong {font-size: 13px; color: #31523E;}
+.import-note p {font-size: 12px; color: #728176; line-height: 1.65; margin: 8px 0 0;}
+.empty {padding: 48px 25px; border: 1px dashed #CAD9CE; border-radius: 12px; text-align: center; background: #FAFCFA; color: #64786B;}
+.empty-symbol {display: grid; place-items: center; margin: 0 auto 18px; width: 45px; height: 45px; border-radius: 12px; background: #E5EFE7; color: #387455; font-size: 21px;}
+.empty strong {display: block; font-size: 18px; color: #31523E; letter-spacing: -.02em;}
+.empty p {margin: 10px auto 0; font-size: 13px; max-width: 370px; line-height: 1.7;}
+.candidate-row {display: flex; align-items: center; gap: 12px; padding: 4px 0 6px;}
+.candidate-avatar {display: grid; place-items: center; width: 38px; height: 38px; flex-shrink: 0;
+ border-radius: 10px; background: #ECF3EB; color: #426C44; font-size: 12px; font-weight: 700;}
+.candidate-name {font-size: 15px; font-weight: 650; color: #244A38;}
+.candidate-meta {font-size: 12px; color: #6D8173; margin-top: 3px;}
+.chip {display: inline-block; padding: 4px 9px; border: 1px solid #D5E5D5; background: #F0F6EE;
+ color: #356044; border-radius: 6px; font-size: 11px; margin: 0 5px 7px 0; font-weight: 600;}
+.chip.missing {background: #FBF6EC; border-color: #E7DBC5; color: #85642C;}
+@media (max-width: 800px) {
+ .block-container {padding: 4rem 1.1rem 2rem;}
+ h1 {font-size: 1.75rem !important;}
+ .workspace-tag {display: none;}
+ .sidebar-note {margin-top: 40px;}
+ [data-testid="stMetric"] {padding: 12px 14px; margin-bottom: 12px;}
+ [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] [data-testid="stFileUploader"]) {flex-wrap: wrap;}
+ [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"] [data-testid="stFileUploader"]) > [data-testid="stColumn"] {
+   width: 100% !important; flex: 1 1 100% !important; min-width: 0 !important;
+ }
+}

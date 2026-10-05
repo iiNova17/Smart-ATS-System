@@ -1,0 +1,12 @@
+# Model service only. Keep Kaggle's existing PyTorch/CUDA installation.
+transformers>=4.51,<5
+accelerate>=1.2,<2
+bitsandbytes>=0.45,<1
+sentence-transformers>=3.4,<6
+langchain-core>=0.3.75,<1
+langchain-huggingface>=0.3.1,<1
+langchain-text-splitters>=0.3.9,<1
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+ngrok>=1.4,<2
+requests>=2.32,<3
