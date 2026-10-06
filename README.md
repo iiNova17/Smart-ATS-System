@@ -1,4 +1,4 @@
-# Smart ATS
+# Smart ATS System
 
 A local candidate workspace for importing CVs, finding skills, building shortlists, and
 exploring individual profiles. Streamlit runs on your computer; Kaggle runs the models.
