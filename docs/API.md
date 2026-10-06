@@ -1,4 +1,4 @@
-# Kaggle model API · version 4.0.0
+# Kaggle model API · version 4.1.0
 
 The API performs model inference and LangChain parsing only. Candidate storage, uploads,
 source verification, filtering, scoring, ranking, RAG retrieval and exports run locally.
@@ -7,16 +7,32 @@ No candidate library, vector store or search/rank endpoints exist on Kaggle.
 All requests use `Authorization: Bearer <ATS_API_KEY>` and
 `ngrok-skip-browser-warning: true`. The app derives the HTTPS base URL from your private
 `NGROK_DOMAIN`; `ATS_API_URL` optionally overrides it for development. The notebook and
-app must both use API **4.0.0**. No session header or candidate ID is sent.
+app must both use API **4.1.0**. No session header or candidate ID is sent.
 
 | Method | Endpoint | Input | Output |
 |---|---|---|---|
-| GET | `/health` | No body | `{status: "ok", version: "4.0.0"}` |
+| GET | `/health` | No body | `{status: "ok", version: "4.1.0"}` |
 | POST | `/interpret` | `{query: string}` | `{criteria: {intent, requirements}}` |
 | POST | `/evaluate` | `{text: string, criteria: object}` | `{assessment: {name, headline, relevant, explanation, assessments}}` |
 | POST | `/analyze` | `{text: string}` | `{analysis: profile_dictionary}` |
 | POST | `/embed` | `{texts: [string, ...]}` | `{embedding_version, items: [{vector, chunks: [{text, vector}]}]}` |
 | POST | `/answer` | `{question: string, passages: [string, ...]}` | `{answer: string}` |
+| POST | `/jobs` | `{task: "analyze"/"evaluate"/"interpret"/"embed"/"answer", input: object}` | HTTP 202, `{job_id}` |
+| GET | `/jobs/{job_id}` | No body | `{status: "queued"/"running"/"completed"/"failed", result?, error?}` |
+| DELETE | `/jobs/{job_id}` | No body | `{status: "released"}` |
+
+The local app uses `/jobs` for every inference operation. Submission and polling are short
+HTTP requests; a slow generation does not hold one tunnel response open. One worker executes
+requests sequentially. Completed results are dictionaries with the same shape as the direct
+endpoints above. A failed job returns `error: {status_code, detail}`, using the same safe
+error contract. Polling a failed job does not rerun generation.
+
+The client polls once per second, tolerates two consecutive transport failures, and releases
+results after reading them. Inference has a ten-minute overall deadline. Running jobs cannot
+be interrupted by DELETE; queued jobs can be canceled. Finished requests older than
+15 minutes are pruned on submission/polling; shutdown clears remaining results.
+Jobs and results exist only in memory; no CV library or index
+is created on Kaggle. The direct endpoints remain available for development checks.
 
 ## Search interpretation
 
@@ -86,12 +102,31 @@ review notes. Unknown fields use null/empty defaults. Fenced JSON is accepted; i
 JSON is rejected. Unknown nested text values may be null; explicitly stated numeric years
 are stored as text. The local app checks quotes and persists profiles.
 
-Analysis and assessment split long CVs into overlapping 2,200-token sections with 100-token
+Profiles use 1,800-token sections; assessments use 1,200-token sections, both with 100-token
 overlap, processing every section. Profile facts are merged without inferring new facts;
 review notes flag potential overlapping entries. Assessments retain the strongest supported
 status for each criterion. Partial evidence is never promoted to met during merging.
-Each generation has a 2,600-token output budget, with one retry for invalid JSON.
-The local client allows up to 15 minutes for section-based profile/assessment requests.
+Profile output is capped at 768 tokens. Assessment uses groups of up to four requirements,
+with 360–720 output tokens per group. Interpretation normally uses 768 tokens and scales
+to 4,096 for long descriptions/lists; answers use 384.
+One retry includes the actual format error. Incomplete JSON is rejected, never silently repaired.
+
+Internally, profile descriptions and evidence use explicit source labels `[L1]`, `[L2]`, etc.
+Prompts state the valid label range for each CV section. Assessment
+checks use fixed-order rows: `[status, depth, reason, source_labels]`, e.g. `[..., ["L1"]]`.
+The parser also accepts equivalent one-based integer/string references (1 or "1" for L1),
+inclusive ranges (`L2-L6`, `L2–L6`), and verbatim text verified against the CV, with no offset
+guessing. Zero, absent labels and non-integer numeric references are rejected.
+Invalid optional citations are isolated: valid profile fields remain, with a review note
+and a visible notice in the UI. In assessments, a claim without any verified evidence becomes
+`not_found`. Missing requirement rows and malformed JSON still fail validation. A bad citation
+does not cause the entire model response to be regenerated.
+
+Profile experience, education and projects use short positional arrays inside the chain;
+the output parser restores the public dictionaries. Descriptions use ranges to preserve
+all source lines without repeating their text. The local client locates skill excerpts
+after extraction, reducing the text the model must generate.
+Greedy decoding resets Qwen's sampling defaults to avoid ignored-generation-flags warnings.
 
 Chains use familiar LangChain composition:
 
@@ -124,8 +159,10 @@ runtime failure. A 503 contains a safe message, code and error reference:
 ```
 
 Match the reference to the Kaggle cell output. Logs contain operation name, exception
-class and stack frames, not CV text, keys, model output or arbitrary exception messages.
+class and stack frames, token counts, generation timing and controlled schema-validation
+messages. They exclude CV text, keys, model output and arbitrary runtime exception messages.
 GPU out-of-memory errors have a specific restart message. Failures preserve local CVs.
-Application code stores no candidate data on Kaggle. Provider/ngrok retention and traffic
+Application code saves no candidate data to disk on Kaggle; transient inference results
+exist until released or expired. Provider/ngrok retention and traffic
 inspection are separate settings. This is one private workspace using a shared project
 key; separate user accounts and multiuser isolation are not implemented.

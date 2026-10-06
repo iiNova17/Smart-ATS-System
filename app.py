@@ -120,9 +120,9 @@ def configured_client():
     if st.session_state.client is None:
         client = APIClient(url, key)
         health = client.health()
-        if health.get("status") != "ok" or health.get("version") != "4.0.0":
+        if health.get("status") != "ok" or health.get("version") != "4.1.0":
             raise BackendError(
-                "The AI service needs the updated Kaggle notebook (API 4.0). "
+                "The AI service needs the updated Kaggle notebook (API 4.1). "
                 "Restart its server with the new notebook, then retry."
             )
         st.session_state.client = client
@@ -262,17 +262,37 @@ def library_page():
 
 def run_matching(query, required, preferred=None):
     progress = st.progress(0, text="Understanding your request…")
+    client = None
+    stage = "Understanding your request"
+    completion = 0
     try:
+        client = configured_client()
+
+        def model_update(status, elapsed):
+            label = "Waiting for the model" if status == "queued" else stage
+            progress.progress(completion, text=f"{label} · {elapsed}s")
+
+        if client:
+            client.on_progress = model_update
         criteria = prepare_criteria(workspace, query, required, preferred)
 
         def update(done, total):
-            progress.progress(
-                done / max(total, 1), text=f"Reviewing candidate {min(done + 1, total)} of {total}…"
-            )
+            nonlocal stage, completion
+            completion = done / max(total, 1)
+            stage = f"Reviewing candidate {min(done + 1, total)} of {total}"
+            progress.progress(completion, text=stage + "…")
 
         rows = assess_candidates(workspace, criteria, update)
-        return {"rows": rows, "criteria": criteria, "query": query, "reviewed": len(cvs)}
+        return {
+            "rows": rows,
+            "criteria": criteria,
+            "query": query,
+            "reviewed": len(cvs),
+            "incomplete": workspace.get("assessment_incomplete", 0),
+        }
     finally:
+        if client:
+            client.on_progress = None
         progress.empty()
 
 
@@ -285,6 +305,11 @@ def render_results(result, shortlist=False):
     heading, download = st.columns([4, 1.5])
     heading.subheader(("Your shortlist" if shortlist else "Results") + f" · {len(rows)}")
     st.caption(f"Reviewed {result['reviewed']} candidates · Showing supported matches only")
+    if result.get("incomplete"):
+        st.warning(
+            f"{result['incomplete']} candidate review(s) had unverified requirements. "
+            "Those requirements were not counted as matches. Retry the search or review the original CVs."
+        )
     with st.expander("What the AI looked for"):
         st.text(criteria["intent"])
         for item in criteria["requirements"]:
@@ -458,7 +483,19 @@ def analysis_page():
                 "Prepare a structured profile with experience, education, skills, projects, and supporting evidence."
             )
             if st.button("Prepare profile", type="primary", icon=":material/auto_awesome:"):
+                client = None
+                status_text = st.empty()
                 try:
+                    client = configured_client()
+                    if client:
+                        client.on_progress = lambda status, elapsed: status_text.caption(
+                            (
+                                "Waiting for the model"
+                                if status == "queued"
+                                else "Preparing your profile"
+                            )
+                            + f" · {elapsed}s"
+                        )
                     with st.spinner("Reading the CV and preparing the profile…"):
                         st.session_state.analysis_cache[cv_id] = validate_analysis(
                             analyze_cv(workspace, cv_id)
@@ -466,6 +503,10 @@ def analysis_page():
                     st.rerun()
                 except Exception as exc:
                     show_error(exc)
+                finally:
+                    if client:
+                        client.on_progress = None
+                    status_text.empty()
         with st.expander("Preview document", expanded=True):
             st.text_area(
                 "CV text", record["text"], height=340, disabled=True, key="source_" + cv_id
@@ -474,6 +515,10 @@ def analysis_page():
 
     with st.container(border=True):
         st.subheader(data["name"] or Path(record["filename"]).stem)
+        if data["review_notes"]:
+            st.warning(
+                "Some profile details need review. Check Review notes and the original document below."
+            )
         st.text(data["headline"] or "Professional headline not stated")
         left, middle, right = st.columns(3)
         for column, label, key in [

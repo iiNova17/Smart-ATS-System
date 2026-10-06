@@ -310,9 +310,10 @@ def assess_candidates(workspace, criteria, progress=None):
     criteria = validate_criteria(criteria)
     client = model_client(workspace)
     digest = hashlib.sha256(
-        ("assessment-v3:" + json.dumps(criteria, sort_keys=True)).encode()
+        ("assessment-v5:" + json.dumps(criteria, sort_keys=True)).encode()
     ).hexdigest()
     records = query(workspace, "SELECT id, filename, text, analysis FROM cvs")
+    workspace["assessment_incomplete"] = 0
     rows = []
     for position, cv in enumerate(records, 1):
         if progress:
@@ -329,6 +330,14 @@ def assess_candidates(workspace, criteria, progress=None):
             cv["text"],
         )
         items = assessment["assessments"]
+        if any(item["reason"].startswith("Assessment incomplete:") for item in items):
+            workspace["assessment_incomplete"] += 1
+            # Retry unresolved checks on the next search rather than permanently caching omissions.
+            query(
+                workspace,
+                "DELETE FROM model_cache WHERE cache_key = ?",
+                ("assess:" + cv["id"] + ":" + digest,),
+            )
         required = [item for item, req in zip(items, criteria["requirements"]) if req["required"]]
         # No related-but-insufficient candidate is presented as a required match.
         if not assessment["relevant"] or any(item["status"] != "met" for item in required):
@@ -401,6 +410,14 @@ def analyze_cv(workspace, cv_id):
         else:
             result["review_notes"].append("An unsupported evidence quote was removed.")
     result["evidence"] = valid
+    # Supporting excerpts can be located locally; the model need not regenerate this text.
+    evidenced = {item["skill"].casefold() for item in valid}
+    for skill in result["skills"]:
+        if skill.casefold() not in evidenced:
+            quote = skill_evidence(cv["text"], skill)
+            if quote:
+                result["evidence"].append({"skill": skill, "quote": quote})
+                evidenced.add(skill.casefold())
     query(
         workspace,
         "UPDATE cvs SET analysis = ? WHERE id = ?",

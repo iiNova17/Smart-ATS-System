@@ -2,6 +2,7 @@ import ast
 import asyncio
 import io
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -128,9 +129,21 @@ def connected_workspace(monkeypatch, tmp_path):
 
     def local_request(method, url, **kwargs):
         path = urlparse(url).path
-        calls.append(
-            {"path": path, "payload": kwargs.get("json"), "headers": kwargs.get("headers")}
-        )
+        # Keep the operation-level assertions readable; transport is tested separately.
+        if path == "/jobs" and method == "POST":
+            submitted = kwargs["json"]
+            calls.append(
+                {
+                    "path": "/" + submitted["task"],
+                    "payload": submitted["input"],
+                    "headers": kwargs.get("headers"),
+                    "transport": path,
+                }
+            )
+        elif not path.startswith("/jobs/"):
+            calls.append(
+                {"path": path, "payload": kwargs.get("json"), "headers": kwargs.get("headers")}
+            )
         result = server.request(
             method, path, json=kwargs.get("json"), headers=kwargs.get("headers")
         )
@@ -139,6 +152,7 @@ def connected_workspace(monkeypatch, tmp_path):
         return response
 
     monkeypatch.setattr("ats.client.requests.request", local_request)
+    monkeypatch.setattr("ats.client.time.sleep", lambda _: threading.Event().wait(0.001))
     monkeypatch.setenv("ATS_API_URL", "http://localhost:8000")
     monkeypatch.setenv("ATS_API_KEY", KEY)
     client = APIClient("http://localhost:8000", KEY)
@@ -255,7 +269,7 @@ def test_model_api_is_authenticated_stateless_and_inference_only():
     client = TestClient(create_app(KEY, make_test_runtime()))
     headers = {"Authorization": "Bearer " + KEY}
     assert client.get("/health").status_code == 401
-    assert client.get("/health", headers=headers).json()["version"] == "4.0.0"
+    assert client.get("/health", headers=headers).json()["version"] == "4.1.0"
     assert client.get("/cvs", headers=headers).status_code == 404
     assert client.post("/search", headers=headers, json={"query": "Python"}).status_code == 404
     assert client.post("/rank", headers=headers, json={"required": ["Python"]}).status_code == 404
@@ -295,7 +309,7 @@ def test_profiles_are_grounded_cached_and_available_after_restart(connected_work
     cv_id = add_cv(workspace, {"filename": "maya.txt", "text": SAMPLE})["cv"]["id"]
     assert calls == []
     profile = analyze_cv(workspace, cv_id)
-    assert len(profile["evidence"]) == 1
+    assert {item["skill"] for item in profile["evidence"]} == {"Python", "SQL"}
     assert profile["review_notes"]
     assert calls[-1]["path"] == "/analyze"
     assert calls[-1]["payload"] == {"text": SAMPLE.strip()}
@@ -511,8 +525,10 @@ def test_notebook_is_standalone_compiles_and_contains_only_inference():
     notebook = json.loads((ROOT / "notebooks/smart_ats_kaggle.ipynb").read_text(encoding="utf-8"))
     blocks = ["".join(cell["source"]) for cell in notebook["cells"] if cell["cell_type"] == "code"]
     assert len(blocks) == 10
-    assert 'response.json()["version"] == "4.0.0"' in blocks[6]
-    assert 'response.json()["version"] == "4.0.0"' in blocks[8]
+    assert 'response.json()["version"] == "4.1.0"' in blocks[6]
+    assert 'response.json()["version"] == "4.1.0"' in blocks[8]
+    assert 'runtime["interpret_query"]("Python")' in blocks[8]
+    assert "def initialize_langchain():" in blocks[4]
     for i, source in enumerate(blocks):
         if "!{sys.executable} -m pip" in source:
             continue

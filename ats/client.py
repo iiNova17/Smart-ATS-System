@@ -1,6 +1,7 @@
 """Authenticated client for stateless Kaggle model requests only."""
 
 import os
+import time
 from urllib.parse import urlparse
 
 import requests
@@ -55,8 +56,9 @@ class APIClient:
             "Authorization": "Bearer " + api_key,
             "ngrok-skip-browser-warning": "true",
         }
+        self.on_progress = None
 
-    def request(self, method, path, payload=None, timeout=180):
+    def request(self, method, path, payload=None, timeout=30):
         try:
             response = requests.request(
                 method,
@@ -90,39 +92,83 @@ class APIClient:
             )
         if not response.ok:
             detail = data.get("detail", "Request failed.")
-            if response.status_code == 503 and isinstance(detail, dict):
-                message = detail.get("message", "The model could not finish this request.")
-                reference = detail.get("reference", "unknown")
-                raise BackendError(f"{message} Reference: {reference}.")
-            if isinstance(detail, list):
-                detail = "; ".join(item.get("msg", "Invalid request") for item in detail)
-            if response.status_code in {400, 404, 422}:
-                raise BackendError(str(detail))
-            if response.status_code == 401:
-                raise BackendError(
-                    "Workspace access needs attention. Please contact your administrator."
-                )
-            raise BackendError("We couldn’t complete this request. Please try again shortly.")
+            self.raise_error(response.status_code, detail)
         return data
+
+    def raise_error(self, status_code, detail):
+        if status_code == 503 and isinstance(detail, dict):
+            message = detail.get("message", "The model could not finish this request.")
+            reference = detail.get("reference", "unknown")
+            raise BackendError(f"{message} Reference: {reference}.")
+        if isinstance(detail, list):
+            detail = "; ".join(item.get("msg", "Invalid request") for item in detail)
+        if status_code in {400, 404, 422, 429}:
+            raise BackendError(str(detail))
+        if status_code == 401:
+            raise BackendError(
+                "Workspace access needs attention. Please contact your administrator."
+            )
+        raise BackendError("We couldn’t complete this request. Please try again shortly.")
+
+    def infer(self, task, payload, timeout=600):
+        """Poll short HTTP requests; a slow generation never holds the tunnel response open."""
+        submitted = self.request("POST", "/jobs", {"task": task, "input": payload})
+        job_id = submitted.get("job_id")
+        if (
+            not isinstance(job_id, str)
+            or len(job_id) != 32
+            or any(char not in "0123456789abcdef" for char in job_id)
+        ):
+            raise BackendError("The AI service returned an invalid request identifier.")
+        started = time.monotonic()
+        path = "/jobs/" + job_id
+        failures = 0
+        try:
+            while time.monotonic() - started < timeout:
+                try:
+                    state = self.request("GET", path)
+                except BackendError:
+                    failures += 1
+                    if failures >= 3:
+                        raise
+                    time.sleep(1)
+                    continue
+                failures = 0
+                if state.get("status") == "completed" and isinstance(state.get("result"), dict):
+                    return state["result"]
+                if state.get("status") == "failed":
+                    error = state.get("error", {})
+                    self.raise_error(
+                        error.get("status_code", 503), error.get("detail", "Model request failed.")
+                    )
+                if state.get("status") not in {"running", "queued"}:
+                    raise BackendError("The AI service returned an invalid request status.")
+                if self.on_progress:
+                    self.on_progress(state["status"], int(time.monotonic() - started))
+                time.sleep(1)
+            raise BackendError(
+                "This model request exceeded ten minutes. Check generation timings in Kaggle."
+            )
+        finally:
+            try:
+                self.request("DELETE", path, timeout=5)
+            except BackendError:
+                pass
 
     def health(self):
         return self.request("GET", "/health", timeout=15)
 
     def embed(self, texts):
-        return self.request("POST", "/embed", {"texts": texts}, timeout=300)
+        return self.infer("embed", {"texts": texts})
 
     def analyze(self, text):
-        return self.request("POST", "/analyze", {"text": text}, timeout=900)["analysis"]
+        return self.infer("analyze", {"text": text})["analysis"]
 
     def interpret(self, query):
-        return self.request("POST", "/interpret", {"query": query}, timeout=300)["criteria"]
+        return self.infer("interpret", {"query": query})["criteria"]
 
     def evaluate(self, text, criteria):
-        return self.request("POST", "/evaluate", {"text": text, "criteria": criteria}, timeout=900)[
-            "assessment"
-        ]
+        return self.infer("evaluate", {"text": text, "criteria": criteria})["assessment"]
 
     def answer(self, question, passages):
-        return self.request(
-            "POST", "/answer", {"question": question, "passages": passages}, timeout=300
-        )["answer"]
+        return self.infer("answer", {"question": question, "passages": passages})["answer"]

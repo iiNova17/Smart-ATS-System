@@ -27,14 +27,14 @@ def main():
             return 1
         client = APIClient(url, key)
         health = client.health()
-        if health.get("status") != "ok" or health.get("version") != "4.0.0":
+        if health.get("status") != "ok" or health.get("version") != "4.1.0":
             print("Unexpected API version. Run the updated Kaggle notebook.")
             return 1
     except BackendError as exc:
         print(str(exc))
         print("Check Kaggle Blocks 7–9, domain ownership, and your local .env.")
         return 1
-    print("Connected to the Smart ATS model API (version 4.0.0).")
+    print("Connected to the Smart ATS model API (version 4.1.0).")
     print("Start Streamlit and upload your CVs to test the model workflows.")
     return 0
 

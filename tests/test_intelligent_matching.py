@@ -177,19 +177,82 @@ def test_generation_chains_accept_all_prompt_variables_and_complete_json(monkeyp
     tokenizer.apply_chat_template.return_value = "rendered prompt"
     tokenizer.decode.side_effect = [
         json.dumps(CRITERIA),
-        json.dumps(assessment(CV)),
-        '{"name":"Alex","skills":["Python"]}',
+        json.dumps(
+            {
+                "relevant": True,
+                "explanation": "The project demonstrates navigation.",
+                "checks": {
+                    "R2": ["met", "applied", "Navigation is documented.", ["L1"]],
+                    "R1": ["met", "applied", "Supported robotics work.", ["L1"]],
+                },
+            }
+        ),
+        '{"name":"Alex","skills":["Python"],"experience":[["Engineer","Org","2024",["L1","L999"]]]}',
         "The project uses ROS 2. [Passage 1]",
     ]
-    model = SimpleNamespace(device="cpu", generate=lambda **kwargs: [[0, 0, 0, 9]])
+    generate = MagicMock(return_value=[[0, 0, 0, 9]])
+    settings = SimpleNamespace(do_sample=True, temperature=0.7, top_p=0.8, top_k=20)
+    model = SimpleNamespace(device="cpu", generate=generate, generation_config=settings)
     runtime = make_runtime(tokenizer, model, None, None)
     assert runtime["interpret_query"]("ros2 robotics")["requirements"][0]["label"] == "ROS 2"
     assert runtime["evaluate_text"](CV, CRITERIA)["assessments"][0]["status"] == "met"
-    assert runtime["analyze_text"](CV)["skills"] == ["Python"]
+    profile = runtime["analyze_text"](CV)
+    assert profile["skills"] == ["Python"]
+    assert profile["experience"][0]["details"] == [CV]
+    assert profile["review_notes"]  # Bad optional evidence does not regenerate the profile.
     assert "[Passage 1]" in runtime["answer_question"](CV, "Which framework?")
     assert all(
         call.kwargs["tokenize"] is False for call in tokenizer.apply_chat_template.call_args_list
     )
+    assert [call.kwargs["max_new_tokens"] for call in generate.call_args_list] == [
+        768,
+        480,
+        768,
+        384,
+    ]
+    assert settings.do_sample is False and settings.temperature == settings.top_p == 1.0
+    assert settings.top_k == 50
+
+    # A larger role must cover later criteria rather than silently truncate or lose indices.
+    many = {"intent": "Several requirements", "requirements": CRITERIA["requirements"] * 3}
+    tokenizer.decode.side_effect = [
+        json.dumps(
+            {
+                "relevant": True,
+                "explanation": "Supported robotics work.",
+                "checks": {
+                    f"R{index + 1}": ["met", "applied", "Supported project.", ["L1"]]
+                    for index in range(count)
+                },
+            }
+        )
+        for count in (4, 2)
+    ]
+    result = runtime["evaluate_text"](CV, many)
+    assert [item["index"] for item in result["assessments"]] == list(range(6))
+    assert all(item["quotes"] == [CV] for item in result["assessments"])
+
+
+def test_kaggle_missing_legacy_langchain_globals_are_initialized_before_invocation(monkeypatch):
+    import langchain_core.globals as globals_module
+    from langchain_core.runnables import RunnableLambda
+
+    # Core 0.3 sees Kaggle's preinstalled root module but its legacy attributes are absent.
+    root_module = SimpleNamespace(__version__="1.0.0")
+    monkeypatch.setitem(sys.modules, "langchain", root_module)
+    monkeypatch.setattr(globals_module, "langchain", root_module, raising=False)
+    monkeypatch.setattr(globals_module, "_HAS_LANGCHAIN", True)
+    for name, value in [("_debug", False), ("_verbose", False), ("_llm_cache", None)]:
+        monkeypatch.setattr(globals_module, name, value)
+    with pytest.raises(AttributeError, match="debug"):
+        RunnableLambda(lambda text: text).invoke("Python")
+    parser = build_analysis_parser()
+    assert parser.invoke('{"name":"Alex","skills":["Python"]}')["name"] == "Alex"
+    assert root_module.debug is False and root_module.verbose is False
+    assert root_module.llm_cache is None
+    assert globals_module.get_debug() is False
+    assert globals_module.get_verbose() is False
+    assert globals_module.get_llm_cache() is None
 
 
 def test_concrete_project_evidence_breaks_equal_coverage_ties(tmp_path):
@@ -223,3 +286,21 @@ def test_concrete_project_evidence_breaks_equal_coverage_ties(tmp_path):
     rows = assess_candidates(workspace, criteria)
     assert rows[0]["filename"] == "z_projects.txt"
     assert rows[0]["score"] == rows[1]["score"] == 100
+
+
+def test_incomplete_assessment_is_visible_and_not_permanently_cached(tmp_path):
+    calls = []
+
+    def evaluate(text, criteria):
+        calls.append(text)
+        result = assessment(text, ["met", "not_found"])
+        result["assessments"][1]["reason"] = "Assessment incomplete: omitted check."
+        return result
+
+    workspace = open_workspace(tmp_path, lambda: SimpleNamespace(evaluate=evaluate))
+    add_cv(workspace, {"filename": "candidate.txt", "text": CV})
+    assert assess_candidates(workspace, CRITERIA) == []
+    assert workspace["assessment_incomplete"] == 1
+    assert assess_candidates(workspace, CRITERIA) == []
+    assert len(calls) == 2
+    assert workspace["assessment_incomplete"] == 1
